@@ -1,0 +1,8 @@
+# Databricks Workspace URLs
+# Add one workspace URL per line
+# Lines starting with # are ignored
+
+# Example URLs (replace with your actual workspace URLs):
+# https://adb-1234567890123456.7.azuredatabricks.net
+# https://adb-2345678901234567.8.azuredatabricks.net
+# https://my-workspace.cloud.databricks.com

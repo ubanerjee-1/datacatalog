@@ -1,0 +1,28 @@
+resources:
+  jobs:
+    bhe_table_enrich:
+      name: "[${bundle.target}] BHE AI Table Enrichment"
+      max_concurrent_runs: 1
+      tasks:
+        - task_key: "enrich_tables"
+          spark_python_task:
+            python_file: ../src/jobs/ai_enrich_tables.py
+            parameters:
+              - "--catalog"
+              - "${var.catalog}"
+              - "--silver-schema"
+              - "bhe_silver"
+              - "--gold-schema"
+              - "bhe_gold"
+              - "--batch-size"
+              - "200"
+              - "--max-batches"
+              - "500"
+          environment_key: "default"
+      environments:
+        - environment_key: "default"
+          spec:
+            client: "2"
+      # The user running `databricks bundle deploy` is granted CAN_MANAGE
+      # automatically. Add an explicit `permissions:` block here if you need
+      # to share ownership with another user/group.

@@ -1,0 +1,34 @@
+resources:
+  apps:
+    bhe_catalog_app:
+      name: bhe-data-catalog-${bundle.target}
+      description: "AI-Powered Data Catalog for Berkshire Hathaway Energy"
+      source_code_path: ../src/app
+
+      # Runtime env (catalog, schemas, warehouse, LLM endpoint) lives in
+      # src/app/app.yml so it ships with the app source. To point the deployed
+      # app at a different catalog, edit src/app/app.yml (BHE_CATALOG) and
+      # re-run `databricks bundle deploy` + `databricks bundle run bhe_catalog_app`.
+
+      resources:
+        - name: sql-warehouse
+          sql_warehouse:
+            id: ${var.warehouse_id}
+            permission: CAN_USE
+
+      permissions:
+        # The user running `databricks bundle deploy` is automatically granted
+        # CAN_MANAGE on the app, so no explicit owner block is needed here. To
+        # add an additional admin, uncomment and replace the placeholder:
+        # - level: CAN_MANAGE
+        #   user_name: <your-admin-email>@example.com
+        #
+        # `account users` is the account-level system group that contains
+        # every user + service principal in the Databricks account. Granting
+        # CAN_USE here is what powers the "Anyone in my organization can use"
+        # toggle in the App permissions UI. The workspace-local group
+        # (`users`) only covers people already provisioned in this workspace
+        # -- not the same thing.
+        # See https://docs.databricks.com/aws/en/dev-tools/databricks-apps/permissions
+        - level: CAN_USE
+          group_name: account users

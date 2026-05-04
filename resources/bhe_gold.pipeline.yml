@@ -1,0 +1,14 @@
+resources:
+  pipelines:
+    bhe_gold_pipeline:
+      name: "[${bundle.target}] BHE Catalog Gold Aggregations"
+      catalog: ${var.catalog}
+      target: bhe_gold
+      libraries:
+        - file:
+            path: ../src/pipelines/gold_aggregations.py
+      configuration:
+        silver_catalog: ${var.catalog}
+        silver_schema: "bhe_silver"
+      channel: PREVIEW
+      photon: true

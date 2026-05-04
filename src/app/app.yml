@@ -1,0 +1,44 @@
+# =============================================================================
+# Databricks App runtime configuration.
+#
+# These env vars are read by the FastAPI backend at startup. Update them
+# *here* (then `databricks bundle deploy` + `databricks bundle run`) to point
+# the app at a different catalog or warehouse — the in-app Setup Wizard
+# (Company Setup page) will detect mismatches and walk the user through
+# fixing them on first launch.
+#
+# Tip: `python scripts/deploy.py` does this interactively and also runs the
+# UC GRANT statements for the app's service principal.
+# =============================================================================
+
+command: ["uvicorn", "bhe_catalog.backend.app:app", "--workers", "2"]
+
+env:
+  - name: PYTHONPATH
+    value: "/app/python/source_code/src"
+
+  # ---- Required: catalog & warehouse the app reads/writes ------------------
+  # The Unity Catalog where this app lives. The Setup Wizard will create
+  # `BHE_RAW_SCHEMA`, `BHE_SILVER_SCHEMA`, and `BHE_GOLD_SCHEMA` inside this
+  # catalog on first run. The app's service principal must have
+  # USE_CATALOG + CREATE_SCHEMA on it.
+  - name: BHE_CATALOG
+    value: "your_catalog"
+
+  # SQL Warehouse the app routes every Statement Execution call through.
+  # The app's service principal must have CAN_USE on this warehouse.
+  - name: DATABRICKS_WAREHOUSE_ID
+    value: "your-warehouse-id"
+
+  # ---- Schema names (rarely need to change) --------------------------------
+  - name: BHE_RAW_SCHEMA
+    value: "bhe_raw"
+  - name: BHE_SILVER_SCHEMA
+    value: "bhe_silver"
+  - name: BHE_GOLD_SCHEMA
+    value: "bhe_gold"
+
+  # ---- LLM endpoint used by AI enrichment + chatbot ------------------------
+  # Any Databricks model-serving endpoint the SP can query.
+  - name: LLM_ENDPOINT
+    value: "databricks-claude-sonnet-4-6"

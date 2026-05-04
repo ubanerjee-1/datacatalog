@@ -1,0 +1,256 @@
+{
+  "version": 1,
+  "data_sources": {
+    "tables": [
+      {
+        "identifier": "your_catalog.bhe_gold.affiliates"
+      },
+      {
+        "identifier": "your_catalog.bhe_gold.env_consistency"
+      },
+      {
+        "identifier": "your_catalog.bhe_gold.glossary_system_domain"
+      },
+      {
+        "identifier": "your_catalog.bhe_gold.program_affiliate_map"
+      },
+      {
+        "identifier": "your_catalog.bhe_gold.schema_inventory"
+      },
+      {
+        "identifier": "your_catalog.bhe_gold.schema_taxonomy"
+      },
+      {
+        "identifier": "your_catalog.bhe_gold.source_summary"
+      },
+      {
+        "identifier": "your_catalog.bhe_gold.source_system_canonical"
+      },
+      {
+        "identifier": "your_catalog.bhe_gold.use_case_affiliates"
+      },
+      {
+        "identifier": "your_catalog.bhe_gold.use_case_source_requirements"
+      },
+      {
+        "identifier": "your_catalog.bhe_gold.workspace_summary"
+      },
+      {
+        "identifier": "your_catalog.bhe_silver.departments"
+      },
+      {
+        "identifier": "your_catalog.bhe_silver.silver_tables"
+      },
+      {
+        "identifier": "your_catalog.bhe_silver.use_cases"
+      }
+    ]
+  },
+  "instructions": {
+    "text_instructions": [
+      {
+        "content": [
+          "You are an analyst assistant for the BHE (Berkshire Hathaway Energy) Data Catalog. The catalog tracks BHE's Unity Catalog inventory across affiliates (PacifiCorp, NV Energy, MidAmerican, GT&S, Western Hub, etc.), source systems, and business use cases.\n",
+          "\n",
+          "Key entity grains:\n",
+          "- schema: one row per (workspace, catalog, schema) combination -> bhe_gold.schema_inventory\n",
+          "- table: one row per table across all workspaces -> bhe_silver.silver_tables\n",
+          "- use_case: one row per business use case -> bhe_silver.use_cases\n",
+          "- affiliate: one row per BHE operating subsidiary -> bhe_gold.affiliates\n",
+          "- source_system: one row per canonical source system -> bhe_gold.source_system_canonical\n",
+          "- department: one row per owning department -> bhe_silver.departments\n",
+          "\n",
+          "Key joins:\n",
+          "- bhe_silver.use_cases.id = bhe_gold.use_case_affiliates.use_case_id (many-to-many: UC applies to which affiliates)\n",
+          "- bhe_silver.use_cases.id = bhe_gold.use_case_source_requirements.use_case_id (many-to-many: UC needs which source systems)\n",
+          "- bhe_gold.use_case_affiliates.affiliate_name = bhe_gold.affiliates.affiliate_name\n",
+          "- bhe_gold.use_case_source_requirements.required_canonical = bhe_gold.source_system_canonical.canonical\n",
+          "- bhe_silver.use_cases.department = bhe_silver.departments.department_name\n",
+          "- bhe_gold.schema_inventory.schema_key = bhe_gold.schema_taxonomy.schema_key (one-to-many SCD2; filter effective_to IS NULL for current values)\n",
+          "- bhe_gold.schema_inventory.program = bhe_gold.program_affiliate_map.program (program -> affiliate bridge)\n",
+          "\n",
+          "Conventions & preferred tables:\n",
+          "- For schema-level questions, use bhe_gold.schema_inventory (NOT bhe_silver.silver_schemas). schema_inventory has the AI-enriched columns (definition, business_name, data_domain, department_owner).\n",
+          "- 'Production' = schema_inventory.classification = 'PRODUCTION'. Use this filter by default unless the user explicitly asks about dev/qa/sandbox.\n",
+          "- 'Enriched' schemas have schema_inventory.definition <> '' (non-empty).\n",
+          "- For cross-environment consistency (which schemas exist in dev but not prod, etc.) use bhe_gold.env_consistency. Columns in_dev, in_qa, in_prod are booleans.\n",
+          "- For program/affiliate rollups (total schema/table counts, consistency scores) use bhe_gold.source_summary - it's pre-aggregated.\n",
+          "- For workspace-level rollups use bhe_gold.workspace_summary.\n",
+          "- For table-grain questions (count tables by format, find tables by name pattern, etc.) use bhe_silver.silver_tables.\n",
+          "- Source systems: always resolve to the canonical form using bhe_gold.source_system_canonical.canonical. The silver_tables.source_system column contains raw LLM-extracted labels that may be free-text; silver_tables.source_system_canonical is the normalized version.\n",
+          "\n",
+          "Dollar values:\n",
+          "- bhe_silver.use_cases.estimated_value_usd is in USD (not thousands or millions). When summing, format as currency.\n",
+          "\n",
+          "Applicability vs ownership:\n",
+          "- A use case's 'owning company' is use_cases.company_name (may be empty).\n",
+          "- A use case's 'applicable affiliates' is the full set in use_case_affiliates, with applicability IN ('primary','secondary'). This is the more complete view.\n",
+          "\n",
+          "Priority & status:\n",
+          "- use_cases.priority is 'High' | 'Medium' | 'Low'.\n",
+          "- use_cases.status is 'not_started' | 'in_progress' | 'delivered' | 'on_hold'.\n",
+          "\n",
+          "Date handling:\n",
+          "- Many silver_schemas/silver_tables timestamp columns are stored as STRING (ISO format). Cast with TRY_CAST(x AS TIMESTAMP) when aggregating.\n",
+          "\n",
+          "Answer style:\n",
+          "- Be concise and factual. Cite use case names, affiliate names, and canonical source names verbatim.\n",
+          "- When a question is ambiguous about environment (dev/qa/prod), default to prod and note the assumption.\n"
+        ],
+        "id": "9eb1559a4ff0497bbf9c76c3e9ba3460"
+      }
+    ],
+    "example_question_sqls": [
+      {
+        "question": [
+          "Show schemas that exist in dev and qa but not in prod for PacifiCorp."
+        ],
+        "sql": [
+          "SELECT program, schema_name, in_dev, in_qa, in_prod, issue_type\n",
+          "FROM your_catalog.bhe_gold.env_consistency\n",
+          "WHERE affiliate = 'PacifiCorp'\n",
+          "  AND in_dev = true\n",
+          "  AND in_qa = true\n",
+          "  AND in_prod = false\n",
+          "ORDER BY program, schema_name;"
+        ],
+        "id": "10d6c31e589048d7842c30ffa42ff645"
+      },
+      {
+        "question": [
+          "Which departments own the highest total use-case value, and what is the AI-enrichment coverage on the schemas they need?"
+        ],
+        "sql": [
+          "WITH dept_value AS (\n",
+          "  SELECT department,\n",
+          "         SUM(estimated_value_usd) AS total_value_usd,\n",
+          "         COUNT(*) AS use_case_count\n",
+          "  FROM your_catalog.bhe_silver.use_cases\n",
+          "  WHERE estimated_value_usd IS NOT NULL AND department <> ''\n",
+          "  GROUP BY department\n",
+          "),\n",
+          "dept_sources AS (\n",
+          "  SELECT uc.department,\n",
+          "         r.required_canonical\n",
+          "  FROM your_catalog.bhe_silver.use_cases uc\n",
+          "  JOIN your_catalog.bhe_gold.use_case_source_requirements r ON uc.id = r.use_case_id\n",
+          "  WHERE r.required_canonical <> 'Unmapped'\n",
+          "),\n",
+          "source_enrichment AS (\n",
+          "  SELECT si.source_system,\n",
+          "         COUNT(*) AS schema_count,\n",
+          "         SUM(CASE WHEN si.definition <> '' THEN 1 ELSE 0 END) AS enriched_count\n",
+          "  FROM your_catalog.bhe_gold.schema_inventory si\n",
+          "  WHERE si.classification = 'PRODUCTION' AND si.source_system <> ''\n",
+          "  GROUP BY si.source_system\n",
+          ")\n",
+          "SELECT dv.department,\n",
+          "       dv.total_value_usd,\n",
+          "       dv.use_case_count,\n",
+          "       ROUND(100.0 * SUM(se.enriched_count) / NULLIF(SUM(se.schema_count), 0), 1) AS pct_enriched_on_required_sources\n",
+          "FROM dept_value dv\n",
+          "LEFT JOIN dept_sources ds ON dv.department = ds.department\n",
+          "LEFT JOIN source_enrichment se ON ds.required_canonical = se.source_system\n",
+          "GROUP BY dv.department, dv.total_value_usd, dv.use_case_count\n",
+          "ORDER BY dv.total_value_usd DESC;"
+        ],
+        "id": "1f123bff14494a2f8366cad05caa37ba"
+      },
+      {
+        "question": [
+          "What are the top 10 use cases by estimated annual value, grouped by department?"
+        ],
+        "sql": [
+          "SELECT department,\n",
+          "       use_case_name,\n",
+          "       estimated_value_usd,\n",
+          "       priority,\n",
+          "       status\n",
+          "FROM your_catalog.bhe_silver.use_cases\n",
+          "WHERE estimated_value_usd IS NOT NULL\n",
+          "ORDER BY estimated_value_usd DESC\n",
+          "LIMIT 10;"
+        ],
+        "id": "3f55cba46b6b4b87a8234d1a34c616b9"
+      },
+      {
+        "question": [
+          "List use cases that depend on canonical source systems we don't have in the lake yet."
+        ],
+        "sql": [
+          "WITH sources_in_lake AS (\n",
+          "  SELECT DISTINCT source_system\n",
+          "  FROM your_catalog.bhe_gold.schema_inventory\n",
+          "  WHERE source_system IS NOT NULL AND source_system <> ''\n",
+          ")\n",
+          "SELECT uc.id,\n",
+          "       uc.use_case_name,\n",
+          "       uc.department,\n",
+          "       uc.priority,\n",
+          "       uc.estimated_value_usd,\n",
+          "       r.required_canonical AS missing_source,\n",
+          "       r.necessity\n",
+          "FROM your_catalog.bhe_silver.use_cases uc\n",
+          "JOIN your_catalog.bhe_gold.use_case_source_requirements r ON uc.id = r.use_case_id\n",
+          "LEFT JOIN sources_in_lake s ON r.required_canonical = s.source_system\n",
+          "WHERE s.source_system IS NULL\n",
+          "  AND r.required_canonical <> 'Unmapped'\n",
+          "ORDER BY uc.estimated_value_usd DESC NULLS LAST;"
+        ],
+        "id": "3fcffe3c00a049fc9a6b8aa6c202cc48"
+      },
+      {
+        "question": [
+          "Which canonical source systems are required by the most use cases?"
+        ],
+        "sql": [
+          "SELECT r.required_canonical AS source_system,\n",
+          "       c.category,\n",
+          "       COUNT(DISTINCT r.use_case_id) AS use_case_count,\n",
+          "       SUM(CASE WHEN r.necessity = 'must_have' THEN 1 ELSE 0 END) AS must_have_count\n",
+          "FROM your_catalog.bhe_gold.use_case_source_requirements r\n",
+          "LEFT JOIN your_catalog.bhe_gold.source_system_canonical c\n",
+          "  ON r.required_canonical = c.canonical\n",
+          "WHERE r.required_canonical <> 'Unmapped'\n",
+          "GROUP BY r.required_canonical, c.category\n",
+          "ORDER BY use_case_count DESC\n",
+          "LIMIT 20;"
+        ],
+        "id": "8a356489f1df49beab52c2ddfb6229a7"
+      },
+      {
+        "question": [
+          "For each program, how many tables exist in PROD vs DEV environments?"
+        ],
+        "sql": [
+          "SELECT program,\n",
+          "       affiliate,\n",
+          "       dev_tables,\n",
+          "       qa_tables,\n",
+          "       prod_tables,\n",
+          "       total_tables,\n",
+          "       consistency_score\n",
+          "FROM your_catalog.bhe_gold.source_summary\n",
+          "ORDER BY prod_tables DESC;"
+        ],
+        "id": "bd208fdcbca74025bff2d447bf16d378"
+      },
+      {
+        "question": [
+          "How many production schemas are enriched per affiliate?"
+        ],
+        "sql": [
+          "SELECT affiliate,\n",
+          "       COUNT(*) AS total_prod_schemas,\n",
+          "       SUM(CASE WHEN definition <> '' THEN 1 ELSE 0 END) AS enriched_schemas,\n",
+          "       ROUND(100.0 * SUM(CASE WHEN definition <> '' THEN 1 ELSE 0 END) / COUNT(*), 1) AS pct_enriched\n",
+          "FROM your_catalog.bhe_gold.schema_inventory\n",
+          "WHERE classification = 'PRODUCTION'\n",
+          "GROUP BY affiliate\n",
+          "ORDER BY pct_enriched DESC, total_prod_schemas DESC;"
+        ],
+        "id": "dad01612c7374a23b5f93fdded0bba9f"
+      }
+    ]
+  }
+}

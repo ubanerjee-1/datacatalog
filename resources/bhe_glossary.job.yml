@@ -1,0 +1,24 @@
+resources:
+  jobs:
+    bhe_glossary:
+      name: "[${bundle.target}] BHE Glossary Builder"
+      max_concurrent_runs: 1
+      tasks:
+        - task_key: "build_glossary"
+          spark_python_task:
+            python_file: ../src/jobs/build_glossary.py
+            parameters:
+              - "--catalog"
+              - "${var.catalog}"
+              - "--silver-schema"
+              - "bhe_silver"
+              - "--gold-schema"
+              - "bhe_gold"
+          environment_key: "default"
+      environments:
+        - environment_key: "default"
+          spec:
+            client: "2"
+      # The user running `databricks bundle deploy` is granted CAN_MANAGE
+      # automatically. Add an explicit `permissions:` block here if you need
+      # to share ownership with another user/group.

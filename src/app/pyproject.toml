@@ -1,0 +1,44 @@
+[project]
+name = "bhe-catalog"
+version = "0.1.0"
+description = "AI-Powered Data Catalog for Berkshire Hathaway Energy"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.119.0",
+    "pydantic-settings>=2.11.0",
+    "uvicorn>=0.37.0",
+    "databricks-sdk>=0.74.0",
+    "databricks-sql-connector>=3.0.0",
+]
+
+[dependency-groups]
+dev = [
+    "ty>=0.0.12",
+]
+
+[tool.apx.metadata]
+app-name = "bhe-catalog"
+app-slug = "bhe_catalog"
+app-entrypoint = "bhe_catalog.backend.app:app"
+api-prefix = "/api"
+metadata-path = "src/bhe_catalog/_metadata.py"
+
+[tool.apx.ui]
+root = "src/bhe_catalog/ui"
+
+[tool.apx.ui.registries]
+"@animate-ui" = "https://animate-ui.com/r/{name}.json"
+"@ai-elements" = "https://registry.ai-sdk.dev/{name}.json"
+"@svgl" = "https://svgl.app/r/{name}.json"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build]
+artifacts = ["src/bhe_catalog/__dist__", "src/bhe_catalog/_metadata.py"]
+exclude = ["src/bhe_catalog/ui"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/bhe_catalog"]

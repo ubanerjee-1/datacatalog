@@ -1,0 +1,60 @@
+# BHE Catalog Explorer — Genie Space
+#
+# Promotion path for the Genie space that backs the in-app chatbot's
+# `genie_ask` fallback tool.
+#
+# ============================================================================
+# HOW TO DEPLOY THIS RESOURCE
+# ============================================================================
+#
+# Genie Space support was added to Databricks Asset Bundles in early 2026
+# (CLI PR databricks/cli#4191). Two requirements apply:
+#
+#   1. Databricks CLI v0.287.0 or later.
+#      Our workspace currently has v0.280.0 — upgrade before first deploy:
+#        brew upgrade databricks
+#      (or the equivalent installer for your platform).
+#
+#   2. Bundle direct-deploy engine (NOT the default Terraform engine).
+#      The databricks_genie_space Terraform resource does not yet exist,
+#      so this bundle must be deployed using:
+#        DATABRICKS_BUNDLE_ENGINE=direct databricks bundle deploy -t <target>
+#
+# If the rest of the BHE bundle is deployed with Terraform, either:
+#   (a) Exclude this single resource from Terraform-mode deploys and run the
+#       Python bootstrap (src/app/create_genie_space.py) on first deploy +
+#       when serialized_space changes, OR
+#   (b) Migrate the full bundle to direct-deploy engine. Recommended once
+#       all other resources are certified on direct mode.
+#
+# ============================================================================
+# SOURCE OF TRUTH
+# ============================================================================
+#
+# The actual space content (tables, instructions, example questions) lives in
+# resources/genie_spaces/bhe_catalog_explorer.json. That file is referenced by:
+#   - this DAB resource (via ${file(...)} interpolation)
+#   - src/app/create_genie_space.py (the API bootstrap script)
+#
+# Editing that JSON is the ONE place to update the space's contents.
+#
+# ============================================================================
+
+resources:
+  genie_spaces:
+    bhe_catalog_explorer:
+      title: "BHE Catalog Explorer"
+      description: >-
+        Natural-language exploration of the BHE Data Catalog. Covers Unity
+        Catalog inventory (schemas, tables), business use cases, affiliates,
+        source systems, and cross-environment consistency. Backing store for
+        the in-app chatbot's fallback data-query tool.
+      warehouse_id: ${var.warehouse_id}
+      # parent_path defaults to workspace.resource_path if omitted.
+      # serialized_space is loaded from the canonical JSON file so the same
+      # content is used by the Python bootstrap and by this bundle.
+      serialized_space: ${file('genie_spaces/bhe_catalog_explorer.json')}
+
+      permissions:
+        - group_name: "account users"
+          level: CAN_RUN

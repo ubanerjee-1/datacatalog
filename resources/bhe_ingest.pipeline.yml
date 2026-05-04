@@ -1,0 +1,15 @@
+resources:
+  pipelines:
+    bhe_ingest_pipeline:
+      name: "[${bundle.target}] BHE Catalog Ingest"
+      catalog: ${var.catalog}
+      target: bhe_raw
+      libraries:
+        - file:
+            path: ../src/pipelines/bronze_ingest.py
+      configuration:
+        schema_location_base: "/Volumes/${var.catalog}/bhe_raw/pipeline_metadata/schemas"
+        landing_schemas_path: "/Volumes/${var.catalog}/bhe_raw/landing/schemas/"
+        landing_tables_path: "/Volumes/${var.catalog}/bhe_raw/landing/tables/"
+      channel: PREVIEW
+      photon: true

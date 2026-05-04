@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+.DS_Store
+node_modules/
+dist/
+.venv/
+*.egg-info/
+.databricks/
+.env
+*.csv
+!schema-extractor/**/*.csv
+
+# Local-only artifacts (not safe to publish)
+scratch_*.py
+analyze_data.py
+.cursor/
+.vscode/
