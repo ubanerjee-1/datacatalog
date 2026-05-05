@@ -112,6 +112,12 @@ are needed (`raw` for Volume uploads, `silver` for ingest + research data,
 | Node.js | ≥ 20 | Builds the React SPA (`npx vite build`) |
 | Git | any | `git clone` |
 
+> [!NOTE]
+> **Windows users**: the python.org installer ships `python.exe` and `py.exe`
+> but **not** `python3.exe`. All commands in this README written as
+> `python3 ...` work as `python ...` on Windows — or `py -3 ...` if you have
+> the launcher. Examples below use `python3` for parity with macOS/Linux.
+
 You also need an **authenticated Databricks CLI profile** for the workspace
 you're deploying to. If you don't already have one:
 

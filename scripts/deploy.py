@@ -62,6 +62,24 @@ def die(msg: str, code: int = 1) -> None:
     sys.exit(code)
 
 
+def _resolve_exe(name: str) -> str:
+    """Resolve an executable name to its absolute path.
+
+    Why: on Windows, tools like `npx`, `databricks`, and `npm` install as
+    `.cmd` shims (e.g. `npx.cmd`, `databricks.cmd`). `subprocess.run([...])`
+    without `shell=True` calls Win32 `CreateProcess`, which only resolves
+    `.exe` from PATH — `.cmd`/`.bat`/`.ps1` are invisible to it. Pre-resolving
+    via `shutil.which()` (which respects PATHEXT and finds the `.cmd`)
+    sidesteps this without falling back to `shell=True` (avoids quoting bugs
+    and command-injection foot-guns).
+
+    On macOS / Linux this is effectively a no-op — `which` returns the same
+    binary the kernel would have found anyway.
+    """
+    resolved = shutil.which(name)
+    return resolved or name  # let subprocess raise the original error if absent
+
+
 def run(
     cmd: Sequence[str],
     *,
@@ -71,10 +89,15 @@ def run(
     env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess:
     """Run a subprocess with nice logging. Raises on non-zero unless check=False."""
+    if not cmd:
+        die("run() called with empty command")
+    # Resolve the program (cmd[0]) but keep the printable form using the
+    # short name — full Windows paths look noisy in logs.
+    resolved_cmd = [_resolve_exe(cmd[0]), *cmd[1:]]
     printable = " ".join(f'"{c}"' if " " in c else c for c in cmd)
     info(f"$ {printable}")
     result = subprocess.run(
-        cmd,
+        resolved_cmd,
         cwd=str(cwd) if cwd else None,
         check=False,
         text=True,
@@ -312,10 +335,19 @@ class DeployContext:
 
 
 def ensure_tools() -> None:
+    # Python: we're already running on it, so check the running interpreter's
+    # version directly. Probing PATH for "python3" is unreliable on Windows
+    # where the python.org installer ships only "python" and "py" — Gabriel
+    # at BHE hit exactly that on Win 11 + Python 3.12.
+    if sys.version_info < (3, 10):
+        die(
+            f"Python 3.10+ required (running {sys.version.split()[0]}). "
+            "Install a newer Python from https://www.python.org/downloads/ "
+            "or via `uv python install 3.11`."
+        )
     for tool, hint in [
         ("databricks", "install from https://docs.databricks.com/dev-tools/cli/install.html"),
         ("npx", "install Node.js 20+"),
-        ("python3", "install Python 3.10+"),
     ]:
         if shutil.which(tool) is None:
             die(f"`{tool}` not found on PATH — {hint}")
