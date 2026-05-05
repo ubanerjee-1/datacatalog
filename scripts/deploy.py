@@ -36,6 +36,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 DATABRICKS_YML = REPO_ROOT / "databricks.yml"
 APP_YML = REPO_ROOT / "src" / "app" / "app.yml"
 APP_DIR = REPO_ROOT / "src" / "app"
+DIST_DIR = APP_DIR / "src" / "bhe_catalog" / "__dist__"
 BUNDLE_APP_RESOURCE = "bhe_catalog_app"  # resource key in resources/*.yml
 
 
@@ -549,7 +550,27 @@ def main() -> None:
             info("node_modules not found — running npm install (one-time)")
             run(["npm", "install"], cwd=APP_DIR)
         info("building the frontend with vite")
-        run(["npx", "vite", "build"], cwd=APP_DIR)
+        # On Windows, `npx.cmd` sometimes returns exit code 1 even when vite
+        # itself succeeds (it prints "The system cannot find the path
+        # specified." while probing for npx in alternate locations, and cmd
+        # carries that error code through to the parent). Run with check=False
+        # and verify the build by checking that __dist__/index.html exists,
+        # which is the only artifact downstream steps actually need.
+        result = run(["npx", "vite", "build"], cwd=APP_DIR, check=False)
+        index_html = DIST_DIR / "index.html"
+        assets_dir = DIST_DIR / "assets"
+        if not index_html.is_file() or not assets_dir.is_dir():
+            if result.returncode != 0:
+                die(f"vite build failed with exit {result.returncode}")
+            die(
+                f"vite build returned 0 but {index_html.relative_to(REPO_ROOT)} "
+                f"is missing — something is wrong with the build config"
+            )
+        if result.returncode != 0:
+            warn(
+                f"npx exited with code {result.returncode} but vite produced a "
+                f"valid build — treating as success (Windows npx.cmd quirk)"
+            )
     else:
         info("--skip-build given; reusing existing src/bhe_catalog/__dist__")
 
