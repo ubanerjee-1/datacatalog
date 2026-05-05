@@ -369,6 +369,75 @@ def validate_profile(profile: str) -> None:
         )
 
 
+def host_from_profile(profile: str) -> str | None:
+    """Return the workspace host configured for `profile`, or None if not derivable.
+
+    Closes B-022: previously the user had to pass --workspace-url even
+    when --profile was given, even though the CLI knows the host from
+    .databrickscfg. Now we read it via `databricks auth describe`.
+    """
+    result = run(
+        ["databricks", "auth", "describe", "--profile", profile, "--output", "json"],
+        check=False,
+        capture=True,
+    )
+    if result.returncode != 0:
+        return None
+    try:
+        data = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return None
+    # `databricks auth describe --output json` puts the resolved host under
+    # details.host (recent CLI). Older versions used the verbose
+    # details.configuration.host.value path. Cover both, and fall back to
+    # top-level `host` if a future version flattens the schema.
+    details = data.get("details", {}) or {}
+    h = (
+        details.get("host")
+        or (details.get("configuration", {}) or {}).get("host", {}).get("value")
+        or data.get("host")
+    )
+    return h or None
+
+
+def validate_catalog_compatible(catalog: str, profile: str) -> None:
+    """Pre-flight check that `catalog` can host Delta tables.
+
+    Closes B-021: the prior E2E run failed deep inside terraform with
+    `Cannot create schema in MANAGED_ONLINE_CATALOG` because the user had
+    targeted `dq_inputs` (a Postgres-backed Lakebase catalog). The error
+    surface is opaque and far from the root cause. We catch it up front
+    by inspecting catalog_type before we start any mutations.
+    """
+    info(f"checking catalog `{catalog}` is compatible with Delta")
+    result = run(
+        ["databricks", "catalogs", "get", catalog, "-p", profile, "--output", "json"],
+        check=False,
+        capture=True,
+    )
+    if result.returncode != 0:
+        # Catalog doesn't exist or no access — surface that early too.
+        err = (result.stderr or result.stdout or "").strip()[:300]
+        die(
+            f"catalog `{catalog}` not accessible via profile `{profile}`: {err}\n"
+            f"Either create it (a regular Unity Catalog, not a Lakebase / Postgres one), "
+            f"or grant USE_CATALOG to the principal."
+        )
+    try:
+        data = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        warn(f"could not parse catalogs get output; skipping pre-flight check")
+        return
+    ctype = data.get("catalog_type") or ""
+    if ctype in ("MANAGED_ONLINE_CATALOG", "DELTASHARING_CATALOG", "FOREIGN_CATALOG"):
+        die(
+            f"catalog `{catalog}` has type `{ctype}` which cannot host Delta "
+            f"tables. The app needs a regular MANAGED_CATALOG (or default "
+            f"system-managed catalog). Create one and re-run:\n"
+            f"  databricks catalogs create <name> -p {profile}"
+        )
+
+
 def get_app_service_principal(app_name: str, profile: str, max_wait_s: int = 30) -> str:
     """Poll `databricks apps get` until it returns a service_principal_client_id."""
     deadline = time.time() + max_wait_s
@@ -501,16 +570,27 @@ def gather_context(args: argparse.Namespace) -> DeployContext:
     current_target = read_target_block(target)
     current_env = read_current_app_env()
 
-    host = args.workspace_url or prompt(
-        "Databricks workspace URL",
-        default=current_target.get("host") or None,
-    )
-    host = _normalize_host(host)
-
+    # Resolve profile first so we can derive the host from it (B-022).
+    # Previously --workspace-url was prompted/required even when the CLI
+    # profile already knew the host from .databrickscfg.
     profile = args.profile or prompt(
         "Databricks CLI profile",
         default=current_target.get("profile") or None,
     )
+
+    if args.workspace_url:
+        host = args.workspace_url
+    else:
+        derived = host_from_profile(profile) if profile else None
+        if derived:
+            info(f"using workspace host from CLI profile: {derived}")
+            host = derived
+        else:
+            host = prompt(
+                "Databricks workspace URL",
+                default=current_target.get("host") or None,
+            )
+    host = _normalize_host(host)
 
     catalog = args.catalog or prompt(
         "Unity Catalog",
@@ -555,7 +635,11 @@ def gather_context(args: argparse.Namespace) -> DeployContext:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--target", help="Bundle target (default: prompt, usually 'dev')")
-    parser.add_argument("--workspace-url", help="Databricks workspace URL")
+    parser.add_argument(
+        "--workspace-url",
+        help="Databricks workspace URL (optional when --profile is given; "
+             "the host is read from the CLI profile via `databricks auth describe`).",
+    )
     parser.add_argument("--profile", help="Databricks CLI profile")
     parser.add_argument("--catalog", help="Unity Catalog name")
     parser.add_argument("--warehouse-id", help="SQL warehouse ID")
@@ -590,6 +674,7 @@ def main() -> None:
             die("aborted by user", code=0)
 
     validate_profile(ctx.profile)
+    validate_catalog_compatible(ctx.catalog, ctx.profile)
 
     # --- mutate config files ---
     update_databricks_yml(

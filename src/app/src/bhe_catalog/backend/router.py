@@ -35,6 +35,7 @@ from .db import (
 from .models import (
     AffiliateUpdateIn,
     AffiliateUpsertIn,
+    ArtifactCreateIn,
     ArtifactFiltersOut,
     ArtifactOut,
     ArtifactStatsOut,
@@ -8833,6 +8834,78 @@ async def get_artifact(artifact_id: str) -> dict:
     if not rows:
         raise HTTPException(404, "Artifact not found")
     return rows[0]
+
+
+@router.post("/artifacts", operation_id="createArtifact")
+async def create_artifact(body: ArtifactCreateIn) -> dict:
+    """Manually create a single artifact record (B-016).
+
+    Mirrors the upsert semantics of `POST /ingest/artifacts`: artifact_id is
+    derived from `_artifact_id(name, platform, location)`, so re-creating
+    an "existing" artifact updates in place rather than duplicating. Sets
+    `is_user_edited=true` so a subsequent CSV re-upload doesn't blow over
+    these manual entries.
+    """
+    table = _ensure_artifacts_table()
+    data = body.model_dump()
+
+    name = (data.get("artifact_name") or "").strip()
+    platform = (data.get("platform") or "").strip()
+    if not name:
+        raise HTTPException(400, "artifact_name is required")
+    if not platform:
+        raise HTTPException(400, "platform is required")
+
+    location = (data.get("location_url") or "").strip()
+    aid = _artifact_id(name, platform, location)
+    now_iso = datetime.utcnow().isoformat()
+
+    # Build column / value pairs for an INSERT; default missing keys to ''
+    # for STRING columns so the INSERT shape matches silver_artifacts.
+    cols = [c for c, _ in ARTIFACT_COLUMNS]
+    bool_cols = {c for c, t in ARTIFACT_COLUMNS if t.startswith("BOOLEAN")}
+    val_for: dict[str, str] = {}
+    for col in cols:
+        if col == "artifact_id":
+            val_for[col] = f"'{aid}'"
+        elif col == "is_user_edited":
+            val_for[col] = "true"
+        elif col in ("ingested_at", "updated_at"):
+            val_for[col] = f"'{now_iso}'"
+        elif col == "ingested_by":
+            val_for[col] = "'manual_entry'"
+        elif col in bool_cols:
+            v = data.get(col)
+            val_for[col] = "true" if bool(v) else "false"
+        elif col in data:
+            v = data.get(col)
+            if v is None or v == "":
+                val_for[col] = "''"
+            else:
+                val_for[col] = f"'{_sql_escape(str(v))}'"
+        else:
+            val_for[col] = "''"
+
+    # MERGE so re-running with the same (name, platform, location) triggers
+    # an UPDATE rather than a duplicate INSERT — matches CSV ingest behavior.
+    set_assignments = []
+    for col in cols:
+        if col == "artifact_id":
+            continue
+        set_assignments.append(f"t.{col} = s.{col}")
+
+    insert_cols = ", ".join(cols)
+    insert_vals = ", ".join(f"s.{c}" for c in cols)
+    src_select = ", ".join(f"{val_for[c]} AS {c}" for c in cols)
+
+    execute_query(f"""
+        MERGE INTO {table} AS t
+        USING (SELECT {src_select}) AS s
+        ON t.artifact_id = s.artifact_id
+        WHEN MATCHED THEN UPDATE SET {', '.join(set_assignments)}
+        WHEN NOT MATCHED THEN INSERT ({insert_cols}) VALUES ({insert_vals})
+    """)
+    return {"status": "created", "artifact_id": aid}
 
 
 @router.put("/artifacts/{artifact_id}", operation_id="updateArtifact")

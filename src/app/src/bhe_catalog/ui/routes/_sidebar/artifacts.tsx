@@ -8,11 +8,14 @@ import {
   fetchArtifactDetail,
   fetchArtifactVocabulary,
   updateArtifact,
+  createArtifact,
   deleteArtifact,
   ingestArtifacts,
   uploadFile,
   triggerArtifactEnrichment,
   type Artifact,
+  type ArtifactCreate,
+  type ArtifactFilters,
 } from "@/lib/api-client";
 import {
   Card,
@@ -56,6 +59,7 @@ import {
   Save,
   Trash2,
   Shield,
+  Plus,
 } from "lucide-react";
 import { toast } from "sonner";
 
@@ -150,6 +154,7 @@ function ArtifactsPage() {
   const [offset, setOffset] = useState(0);
   const [selected, setSelected] = useState<Artifact | null>(null);
   const [uploadOpen, setUploadOpen] = useState(false);
+  const [newOpen, setNewOpen] = useState(false);
 
   const limit = 50;
 
@@ -270,6 +275,14 @@ function ArtifactsPage() {
               <Sparkles className="h-4 w-4 mr-1" />
             )}
             Enrich with AI
+          </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => setNewOpen(true)}
+          >
+            <Plus className="h-4 w-4 mr-1" />
+            New
           </Button>
           <Button size="sm" onClick={() => setUploadOpen(true)}>
             <Upload className="h-4 w-4 mr-1" />
@@ -605,6 +618,21 @@ function ArtifactsPage() {
           <UploadPanel
             onClose={() => setUploadOpen(false)}
             onIngested={() => {
+              queryClient.invalidateQueries({ queryKey: ["artifacts"] });
+              queryClient.invalidateQueries({ queryKey: ["artifactFilters"] });
+              queryClient.invalidateQueries({ queryKey: ["artifactStats"] });
+            }}
+          />
+        </SheetContent>
+      </Sheet>
+
+      {/* New (manual entry) Modal */}
+      <Sheet open={newOpen} onOpenChange={setNewOpen}>
+        <SheetContent side="right" className="w-full sm:max-w-md">
+          <NewArtifactPanel
+            filters={filters}
+            onClose={() => setNewOpen(false)}
+            onCreated={() => {
               queryClient.invalidateQueries({ queryKey: ["artifacts"] });
               queryClient.invalidateQueries({ queryKey: ["artifactFilters"] });
               queryClient.invalidateQueries({ queryKey: ["artifactStats"] });
@@ -1378,5 +1406,298 @@ function UploadPanel({
         </Button>
       </div>
     </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// New Artifact Panel (manual entry — B-016)
+// ---------------------------------------------------------------------------
+
+function NewArtifactPanel({
+  filters,
+  onClose,
+  onCreated,
+}: {
+  filters: ArtifactFilters | undefined;
+  onClose: () => void;
+  onCreated: () => void;
+}) {
+  const { data: vocab } = useQuery({
+    queryKey: ["artifactVocabulary"],
+    queryFn: fetchArtifactVocabulary,
+  });
+
+  const [form, setForm] = useState<ArtifactCreate>({
+    artifact_name: "",
+    platform: "",
+    artifact_type: "BI Report",
+    status: "Active",
+    certified: false,
+  });
+  const [submitting, setSubmitting] = useState(false);
+
+  const platformOptions = filters?.platforms ?? [];
+  const teamOptions = filters?.teams ?? [];
+  const domainOptions = filters?.domains ?? [];
+  const departmentOptions = filters?.departments ?? [];
+
+  const set = <K extends keyof ArtifactCreate>(k: K, v: ArtifactCreate[K]) =>
+    setForm((f) => ({ ...f, [k]: v }));
+
+  const submit = async () => {
+    if (!form.artifact_name.trim()) {
+      toast.error("Name is required");
+      return;
+    }
+    if (!form.platform.trim()) {
+      toast.error("Platform is required");
+      return;
+    }
+    setSubmitting(true);
+    try {
+      await createArtifact(form);
+      toast.success("Artifact created");
+      onCreated();
+      onClose();
+    } catch (e) {
+      const err = e as Error;
+      toast.error(`Create failed: ${err.message}`);
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <div className="space-y-4 overflow-y-auto max-h-[calc(100vh-2rem)] pr-1">
+      <SheetHeader>
+        <SheetTitle>New Artifact</SheetTitle>
+        <SheetDescription>
+          Add a single BI report, dashboard, Genie space, or AI agent. The
+          artifact_id is derived from name + platform + URL, so re-creating an
+          existing artifact updates it in place. Manual entries are flagged
+          <code className="mx-1">is_user_edited=true</code>so AI enrichment
+          and CSV re-uploads won't overwrite them.
+        </SheetDescription>
+      </SheetHeader>
+
+      <div className="space-y-3">
+        <NewField label="Name *" required>
+          <Input
+            value={form.artifact_name}
+            onChange={(e) => set("artifact_name", e.target.value)}
+            placeholder="e.g. Energy Trading P&L Dashboard"
+          />
+        </NewField>
+
+        <div className="grid grid-cols-2 gap-3">
+          <NewField label="Platform *" required>
+            <ComboInput
+              value={form.platform || ""}
+              options={platformOptions}
+              placeholder="Tableau, Power BI, Genie…"
+              onChange={(v) => set("platform", v)}
+            />
+          </NewField>
+          <NewField label="Type">
+            <SelectInput
+              value={form.artifact_type || ""}
+              options={vocab?.types ?? []}
+              onChange={(v) => set("artifact_type", v)}
+            />
+          </NewField>
+        </div>
+
+        <NewField label="Description">
+          <textarea
+            className="w-full min-h-[70px] rounded-md border border-input bg-background p-2 text-sm"
+            value={form.description || ""}
+            onChange={(e) => set("description", e.target.value)}
+          />
+        </NewField>
+
+        <NewField label="Location URL">
+          <Input
+            value={form.location_url || ""}
+            onChange={(e) => set("location_url", e.target.value)}
+            placeholder="https://…"
+          />
+        </NewField>
+
+        <div className="grid grid-cols-2 gap-3">
+          <NewField label="Business Owner">
+            <Input
+              value={form.business_owner || ""}
+              onChange={(e) => set("business_owner", e.target.value)}
+            />
+          </NewField>
+          <NewField label="Business Team">
+            <ComboInput
+              value={form.business_team || ""}
+              options={teamOptions}
+              onChange={(v) => set("business_team", v)}
+            />
+          </NewField>
+          <NewField label="Technical Owner">
+            <Input
+              value={form.technical_owner || ""}
+              onChange={(e) => set("technical_owner", e.target.value)}
+            />
+          </NewField>
+          <NewField label="Status">
+            <SelectInput
+              value={form.status || ""}
+              options={vocab?.statuses ?? []}
+              onChange={(v) => set("status", v)}
+            />
+          </NewField>
+          <NewField label="Data Domain">
+            <ComboInput
+              value={form.data_domain || ""}
+              options={domainOptions}
+              onChange={(v) => set("data_domain", v)}
+            />
+          </NewField>
+          <NewField label="Department">
+            <ComboInput
+              value={form.department || ""}
+              options={departmentOptions}
+              onChange={(v) => set("department", v)}
+            />
+          </NewField>
+          <NewField label="Affiliate">
+            <Input
+              value={form.affiliate || ""}
+              onChange={(e) => set("affiliate", e.target.value)}
+            />
+          </NewField>
+          <NewField label="Refresh Frequency">
+            <SelectInput
+              value={form.refresh_frequency || ""}
+              options={vocab?.refresh_frequencies ?? []}
+              onChange={(v) => set("refresh_frequency", v)}
+            />
+          </NewField>
+        </div>
+
+        <NewField label="Topics (comma-separated)">
+          <Input
+            value={form.topics || ""}
+            onChange={(e) => set("topics", e.target.value)}
+            placeholder="finance, trading, hourly"
+          />
+        </NewField>
+
+        <NewField label="Source Schemas (comma-separated)">
+          <Input
+            value={form.source_schemas || ""}
+            onChange={(e) => set("source_schemas", e.target.value)}
+            placeholder="finance.gold, trading.silver"
+          />
+        </NewField>
+
+        <NewField label="Source Tables (comma-separated)">
+          <Input
+            value={form.source_tables || ""}
+            onChange={(e) => set("source_tables", e.target.value)}
+          />
+        </NewField>
+
+        <label className="flex items-center gap-2 text-sm cursor-pointer">
+          <input
+            type="checkbox"
+            checked={!!form.certified}
+            onChange={(e) => set("certified", e.target.checked)}
+          />
+          Mark as certified
+        </label>
+      </div>
+
+      <div className="flex items-center gap-2 justify-end pt-2 border-t">
+        <Button variant="ghost" onClick={onClose}>
+          Cancel
+        </Button>
+        <Button onClick={submit} disabled={submitting}>
+          {submitting && <Loader2 className="h-4 w-4 mr-1 animate-spin" />}
+          Create
+        </Button>
+      </div>
+    </div>
+  );
+}
+
+function NewField({
+  label,
+  required,
+  children,
+}: {
+  label: string;
+  required?: boolean;
+  children: React.ReactNode;
+}) {
+  return (
+    <div className="space-y-1">
+      <label className="text-xs text-muted-foreground">
+        {label}
+        {required && <span className="text-red-500 ml-0.5">*</span>}
+      </label>
+      {children}
+    </div>
+  );
+}
+
+function SelectInput({
+  value,
+  options,
+  onChange,
+}: {
+  value: string;
+  options: string[];
+  onChange: (v: string) => void;
+}) {
+  return (
+    <select
+      className="w-full rounded-md border border-input bg-background px-2 py-1.5 text-sm"
+      value={value}
+      onChange={(e) => onChange(e.target.value)}
+    >
+      <option value="">—</option>
+      {options.map((o) => (
+        <option key={o} value={o}>
+          {o}
+        </option>
+      ))}
+    </select>
+  );
+}
+
+function ComboInput({
+  value,
+  options,
+  onChange,
+  placeholder,
+}: {
+  value: string;
+  options: string[];
+  onChange: (v: string) => void;
+  placeholder?: string;
+}) {
+  // Free-text input + datalist of known values, so users can either
+  // pick an existing platform/team/domain or type a new one without
+  // being constrained to the dropdown.
+  const id = `combo-${Math.random().toString(36).slice(2, 8)}`;
+  return (
+    <>
+      <Input
+        list={id}
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        placeholder={placeholder}
+      />
+      <datalist id={id}>
+        {options.map((o) => (
+          <option key={o} value={o} />
+        ))}
+      </datalist>
+    </>
   );
 }

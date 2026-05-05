@@ -578,6 +578,38 @@ class ArtifactUpdateIn(BaseModel):
     source_tables: Optional[str] = None
 
 
+class ArtifactCreateIn(BaseModel):
+    """Body for POST /artifacts (manual single-record entry, B-016).
+
+    artifact_name + platform are required (used to derive a deterministic
+    artifact_id so re-creating an existing artifact upserts in place).
+    Everything else is optional and matches ArtifactUpdateIn.
+    """
+    artifact_name: str
+    platform: str
+    artifact_type: Optional[str] = "BI Report"
+    description: Optional[str] = None
+    business_owner: Optional[str] = None
+    business_team: Optional[str] = None
+    technical_owner: Optional[str] = None
+    access_level: Optional[str] = None
+    location_url: Optional[str] = None
+    workspace_name: Optional[str] = None
+    folder_path: Optional[str] = None
+    topics: Optional[str] = None
+    affiliate: Optional[str] = None
+    data_domain: Optional[str] = None
+    department: Optional[str] = None
+    use_case_id: Optional[str] = None
+    status: Optional[str] = "Active"
+    refresh_frequency: Optional[str] = None
+    last_refreshed: Optional[str] = None
+    created_date: Optional[str] = None
+    certified: Optional[bool] = False
+    source_schemas: Optional[str] = None
+    source_tables: Optional[str] = None
+
+
 class ArtifactStatsOut(BaseModel):
     total: int = 0
     certified: int = 0

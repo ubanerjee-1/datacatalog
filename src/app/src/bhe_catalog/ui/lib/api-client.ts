@@ -1151,6 +1151,37 @@ export async function updateArtifact(
   return data;
 }
 
+export interface ArtifactCreate {
+  artifact_name: string;
+  platform: string;
+  artifact_type?: string;
+  description?: string;
+  business_owner?: string;
+  business_team?: string;
+  technical_owner?: string;
+  access_level?: string;
+  location_url?: string;
+  workspace_name?: string;
+  folder_path?: string;
+  topics?: string;
+  affiliate?: string;
+  data_domain?: string;
+  department?: string;
+  use_case_id?: string;
+  status?: string;
+  refresh_frequency?: string;
+  last_refreshed?: string;
+  created_date?: string;
+  certified?: boolean;
+  source_schemas?: string;
+  source_tables?: string;
+}
+
+export async function createArtifact(payload: ArtifactCreate) {
+  const { data } = await api.post(`/artifacts`, payload);
+  return data as { status: string; artifact_id: string };
+}
+
 export async function deleteArtifact(artifactId: string) {
   const { data } = await api.delete(
     `/artifacts/${encodeURIComponent(artifactId)}`,
