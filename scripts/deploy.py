@@ -445,6 +445,25 @@ def ensure_schemas_exist(
         )
 
 
+def ensure_volumes_exist(
+    catalog: str, schema: str, volumes: list[str], warehouse_id: str, profile: str
+) -> None:
+    """`CREATE VOLUME IF NOT EXISTS` for the Volumes the app reads/writes.
+
+    The app stores CSV uploads, knowledge-article bodies, and branding
+    assets under `/Volumes/{catalog}/{raw}/uploads/...`. Without the Volume
+    pre-created, the very first upload (logo, CSV, KB attachment) fails
+    with a 404 from the Files API and the user has no obvious next step.
+    """
+    for vol in volumes:
+        info(f"ensuring volume exists: {catalog}.{schema}.{vol}")
+        execute_sql(
+            f"CREATE VOLUME IF NOT EXISTS `{catalog}`.`{schema}`.`{vol}`",
+            warehouse_id=warehouse_id,
+            profile=profile,
+        )
+
+
 def grant_uc(catalog: str, sp_id: str, profile: str, schemas: dict[str, list[str]]) -> None:
     """Idempotent UC grants: catalog-level + per-schema."""
     info("granting catalog-level privileges to the app service principal")
@@ -646,6 +665,16 @@ def main() -> None:
         ensure_schemas_exist(
             catalog=ctx.catalog,
             schemas=[ctx.raw_schema, ctx.silver_schema, ctx.gold_schema],
+            warehouse_id=ctx.warehouse_id,
+            profile=ctx.profile,
+        )
+        # The app writes CSV uploads, KB article bodies, and branding logos
+        # to /Volumes/{catalog}/{raw}/uploads — create it now so the first
+        # upload from the UI doesn't 404.
+        ensure_volumes_exist(
+            catalog=ctx.catalog,
+            schema=ctx.raw_schema,
+            volumes=["uploads"],
             warehouse_id=ctx.warehouse_id,
             profile=ctx.profile,
         )
