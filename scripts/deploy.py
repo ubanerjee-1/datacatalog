@@ -683,8 +683,17 @@ def main() -> None:
             sp_id=sp_id,
             profile=ctx.profile,
             schemas={
+                # gold needs CREATE_TABLE because the in-app wizard's
+                # `setup_bootstrap_tables` endpoint creates 14 gold skeleton
+                # tables (classification_rules, schema_taxonomy, affiliates,
+                # use_case_source_requirements, etc.) on first run. The
+                # original "read-only" assumption was wrong now that we keep
+                # the customer-editable seeds (rules, taxonomy) in gold and
+                # let the wizard provision them. Caught by E2E test on
+                # `ub_test` 2026-05-05 — bootstrap-tables surfaced
+                # PERMISSION_DENIED for all 14 gold tables.
                 ctx.silver_schema: ["USE_SCHEMA", "SELECT", "MODIFY", "CREATE_TABLE"],
-                ctx.gold_schema:   ["USE_SCHEMA", "SELECT", "MODIFY"],
+                ctx.gold_schema:   ["USE_SCHEMA", "SELECT", "MODIFY", "CREATE_TABLE"],
                 ctx.raw_schema:    ["USE_SCHEMA", "SELECT", "MODIFY", "READ_VOLUME", "WRITE_VOLUME"],
             },
         )
