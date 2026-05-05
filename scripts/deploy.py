@@ -536,7 +536,7 @@ def gather_context(args: argparse.Namespace) -> DeployContext:
     )
     llm_endpoint = args.llm_endpoint or prompt(
         "LLM model-serving endpoint",
-        default=current_env.get("LLM_ENDPOINT") or "databricks-claude-sonnet-4-6",
+        default=current_env.get("LLM_ENDPOINT") or "databricks-claude-sonnet-4",
     )
 
     return DeployContext(

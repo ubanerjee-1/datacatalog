@@ -443,7 +443,7 @@ function CompanyPage() {
       <StepCard
         step={5}
         title="Company Intelligence"
-        description="Enter your company name to auto-generate departments, use cases with business value estimates, and required data entities"
+        description="Enter your company name to auto-generate a company profile and the list of departments. Use cases and data-source mappings come later — grounded on your canonical sources and shaped through chat."
         isComplete={hasProfile && hasData && !isResearching}
         locked={!infraReady}
         lockedReason="Complete steps 1–3 first so the database tables exist"
@@ -532,13 +532,14 @@ function CompanyPage() {
               Wipe all company research data?
             </div>
             <div className="text-muted-foreground mb-3">
-              This will permanently delete the existing profile, departments
-              ({researchStatus?.counts?.departments ?? 0}), use cases
-              ({researchStatus?.counts?.use_cases ?? 0}), entities
+              This will permanently delete the existing profile and
+              departments ({researchStatus?.counts?.departments ?? 0}) for
+              "{companyName}" and re-run company research from scratch. Use
+              cases ({researchStatus?.counts?.use_cases ?? 0}), entities
               ({researchStatus?.counts?.use_case_entities ?? 0}), and Sankey
-              mappings ({researchStatus?.counts?.sankey_mappings ?? 0}) for
-              "{companyName}" and run the full pipeline from scratch. This will
-              burn LLM quota equivalent to a fresh run.
+              mappings ({researchStatus?.counts?.sankey_mappings ?? 0}) are
+              <strong> not </strong>wiped — those are populated through the
+              chat / source-system pipeline, not company research.
             </div>
             <div className="flex gap-2">
               <Button
@@ -2430,25 +2431,14 @@ function ResearchProgressTree({
   const profileDone = steps.some((s) => s.step === "profile");
   const deptsDone = steps.some((s) => s.step === "departments");
   const deptItems = steps.filter((s) => s.step === "dept_item").map((s) => s.item_name);
-  const usecaseSteps = steps.filter((s) => s.step.startsWith("usecase:"));
-  const completedDepts = new Set(usecaseSteps.map((s) => s.item_name));
-  const entitiesDone = steps.some((s) => s.step === "entities");
-  const sankeyDone = steps.some((s) => s.step === "sankey");
 
-  const totalSteps = data?.total_steps ?? 0;
-  const currentStepIdx = steps.length > 0 ? Math.max(...steps.map((s) => s.step_index)) : 0;
+  const isComplete = profileDone && deptsDone;
 
-  const statusLabel = sankeyDone
+  const statusLabel = isComplete
     ? "Complete"
-    : entitiesDone
-      ? "Generating mappings..."
-      : usecaseSteps.length > 0
-        ? `Use cases: ${completedDepts.size}/${deptItems.length} departments`
-        : deptsDone
-          ? "Discovering use cases..."
-          : profileDone
-            ? "Discovering departments..."
-            : "Researching company...";
+    : profileDone
+      ? "Discovering departments..."
+      : "Researching company...";
 
   const runPageUrl = data?.run_page_url;
 
@@ -2468,7 +2458,7 @@ function ResearchProgressTree({
               View Databricks run
             </a>
           )}
-          {!sankeyDone && (
+          {!isComplete && (
             <Loader2 className="h-3.5 w-3.5 animate-spin text-blue-400" />
           )}
         </div>
@@ -2484,47 +2474,17 @@ function ResearchProgressTree({
           level={0}
         />
 
-        {/* Department children */}
-        {deptItems.map((dept, i) => {
-          const ucStep = usecaseSteps.find((s) => s.item_name === dept);
-          const isDeptDone = completedDepts.has(dept);
-          const isActive =
-            !isDeptDone &&
-            deptsDone &&
-            completedDepts.size === i &&
-            !entitiesDone;
-
-          return (
-            <div key={dept}>
-              <TreeNode
-                label={dept}
-                status={isDeptDone ? "done" : isActive ? "active" : "pending"}
-                detail={ucStep?.detail}
-                level={1}
-              />
-            </div>
-          );
-        })}
-
-        {/* Entities node */}
-        {usecaseSteps.length > 0 && usecaseSteps.length >= deptItems.length && (
+        {/* Department children — done as soon as departments step emits;
+            company research no longer fans into per-dept use-case generation
+            (that lives in the chat path now). */}
+        {deptItems.map((dept) => (
           <TreeNode
-            label="Data Entities"
-            status={entitiesDone ? "done" : sankeyDone ? "done" : "active"}
-            detail={steps.find((s) => s.step === "entities")?.detail}
+            key={dept}
+            label={dept}
+            status={deptsDone ? "done" : "active"}
             level={1}
           />
-        )}
-
-        {/* Sankey node */}
-        {entitiesDone && (
-          <TreeNode
-            label="Sankey Mappings"
-            status={sankeyDone ? "done" : "active"}
-            detail={steps.find((s) => s.step === "sankey")?.detail}
-            level={1}
-          />
-        )}
+        ))}
       </div>
     </div>
   );

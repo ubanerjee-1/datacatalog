@@ -13,7 +13,7 @@ resources:
               - "--silver-schema"
               - "bhe_silver"
               - "--model-endpoint"
-              - "databricks-claude-sonnet-4-6"
+              - "databricks-claude-sonnet-4"
           environment_key: "default"
       environments:
         - environment_key: "default"

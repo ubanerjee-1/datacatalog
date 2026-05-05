@@ -99,7 +99,7 @@ are needed (`raw` for Volume uploads, `silver` for ingest + research data,
 | **Unity Catalog enabled** | Everything reads/writes through UC | Required |
 | **A Unity Catalog** | The app creates 3 schemas inside it | Pick an existing one or create a fresh one (e.g. `bhe_data_catalog`) |
 | **A SQL warehouse** | The app routes every SQL statement through it | Serverless or classic; size depends on enrichment workload |
-| **A model-serving endpoint** | AI enrichment + chatbot + company research | Any chat-completion endpoint the SP can `CAN_QUERY`. Default: `databricks-claude-sonnet-4-6`. Pay-per-token endpoints work fine |
+| **A model-serving endpoint** | AI enrichment + chatbot + company research | Any chat-completion endpoint the SP can `CAN_QUERY`. Default: `databricks-claude-sonnet-4`. Pay-per-token endpoints work fine |
 | **Permissions to create a Databricks App** | The bundle deploys an App resource | Workspace admin or "Can Manage" on the Apps feature |
 | **Permission to GRANT on the catalog** | Either you, or the deploy script, must grant the app's SP access | Metastore admin or catalog owner |
 
@@ -170,7 +170,7 @@ python3 scripts/deploy.py --yes \
   --profile <cli-profile> \
   --catalog <uc_catalog> \
   --warehouse-id <warehouse_id> \
-  --llm-endpoint databricks-claude-sonnet-4-6
+  --llm-endpoint databricks-claude-sonnet-4
 ```
 
 Pass `--skip-build` to reuse the last `vite build`, `--skip-grants` if the
@@ -226,7 +226,7 @@ env:
   - name: BHE_GOLD_SCHEMA
     value: "bhe_gold"                      # rarely changed
   - name: LLM_ENDPOINT
-    value: "databricks-claude-sonnet-4-6"  # any chat-completion endpoint the SP can CAN_QUERY
+    value: "databricks-claude-sonnet-4"  # any chat-completion endpoint the SP can CAN_QUERY
 ```
 
 > [!IMPORTANT]

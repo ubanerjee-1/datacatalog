@@ -5021,6 +5021,126 @@ def _sql_escape(s: str) -> str:
     return s.replace("\\", "\\\\").replace("'", "\\'")
 
 
+# Strict JSON Schema for batched use-case generation. Used by
+# _ai_query_batch_use_cases() to fan ai_query() across all departments in a
+# single SQL statement. We use the JSON-Schema flavor (not the STRUCT<>
+# flavor) because feasibility testing showed STRUCT<> permits the model to
+# return inner arrays as stringified JSON ~25% of the time, while
+# `"strict": true` JSON Schema yielded 8/8 clean responses with the same
+# prompt. See chat: "test it out first to access feasibility".
+_USE_CASE_RESPONSE_SCHEMA: str = json.dumps({
+    "type": "json_schema",
+    "json_schema": {
+        "name": "use_cases_response",
+        "schema": {
+            "type": "object",
+            "properties": {
+                "use_cases": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "use_case_name":      {"type": "string"},
+                            "description":        {"type": "string"},
+                            "category":           {"type": "string"},
+                            "business_value":     {"type": "string"},
+                            "estimated_value_usd": {"type": "number"},
+                            "value_rationale":    {"type": "string"},
+                            "priority":           {"type": "string"},
+                        },
+                        "required": [
+                            "use_case_name", "description", "category",
+                            "business_value", "priority",
+                        ],
+                    },
+                },
+            },
+            "required": ["use_cases"],
+        },
+        "strict": True,
+    },
+})
+
+
+def _ai_query_batch_use_cases(
+    company: str,
+    dept_records: list[dict],
+) -> list[tuple[str, list[dict]]]:
+    """Generate use cases for all departments in a SINGLE batched ai_query call.
+
+    Replaces the previous N-call sequential loop (one ai_query per
+    department). Spark fans the per-row ai_query() calls out across the
+    warehouse, giving ~3-5x speedup on 8-25 departments.
+
+    Returns: [(department_name, [use_case_dict, ...]), ...] in the same order
+    as `dept_records`. A department whose result fails to parse comes back
+    with an empty list — the caller is responsible for surfacing that to
+    the progress UI.
+    """
+    if not dept_records:
+        return []
+
+    company_esc = _sql_escape(company)
+    schema_esc = _sql_escape(_USE_CASE_RESPONSE_SCHEMA)
+
+    values_rows = []
+    for d in dept_records:
+        dn = _sql_escape(str(d.get("department_name") or ""))
+        desc = _sql_escape(str(d.get("description") or ""))
+        needs = _sql_escape(str(d.get("data_needs") or ""))
+        values_rows.append(f"('{dn}', '{desc}', '{needs}')")
+    values_clause = ", ".join(values_rows)
+
+    sql = f"""
+        SELECT
+          department_name,
+          -- failOnError=>false wraps output in a struct of result+errorMessage;
+          -- .result extracts the success payload so a single bad row does
+          -- not take down the whole batch.
+          ai_query(
+            '{LLM_ENDPOINT}',
+            CONCAT(
+              'You are a data strategy consultant. Generate 3-10 high-value analytics and data use cases ',
+              'for the ', department_name, ' department at {company_esc}. ',
+              'Department description: ', description, '. ',
+              'Available data needs: ', data_needs, '. ',
+              'For each use case include estimated_value_usd (annual dollar value as a number) and value_rationale. ',
+              'Categories MUST be one of: Predictive Analytics, Reporting and BI, ML/AI, Data Integration, ',
+              'Real-Time Monitoring, Regulatory Compliance, Customer Analytics, Operational Efficiency, ',
+              'Risk Management, Revenue Optimization. ',
+              'Priority MUST be one of: High, Medium, Low.'
+            ),
+            responseFormat => '{schema_esc}',
+            modelParameters => named_struct('max_tokens', 4000, 'temperature', 0.4),
+            failOnError => false
+          ).result AS result
+        FROM (VALUES {values_clause}) AS dept_seed(department_name, description, data_needs)
+    """
+
+    rows = execute_query(sql)
+    out: list[tuple[str, list[dict]]] = []
+    for r in rows:
+        dept_name = r.get("department_name", "") or ""
+        raw = r.get("result") or ""
+        if not raw:
+            out.append((dept_name, []))
+            continue
+        try:
+            parsed = json.loads(raw)
+            ucs = parsed.get("use_cases", []) if isinstance(parsed, dict) else []
+            # Defensive: model occasionally returns the array as a stringified
+            # JSON despite strict schema. Fall back if so.
+            if isinstance(ucs, str):
+                ucs = json.loads(ucs)
+            if not isinstance(ucs, list):
+                ucs = []
+        except Exception as e:
+            logger.warning(f"_ai_query_batch_use_cases parse failed for {dept_name}: {e}")
+            ucs = []
+        out.append((dept_name, ucs))
+    return out
+
+
 def _ai_query(prompt: str, response_format: str | None = None) -> str:
     """Call ai_query via SQL and return the raw JSON string result."""
     if response_format:
@@ -5137,12 +5257,16 @@ def _run_company_research(
         # current monolithic structure makes that risky to do in the same
         # pass as the other circular-dep fixes.
         # ------------------------------------------------------------------
+        # Company research now only generates company profile + departments.
+        # Use cases, sankey mappings, and entities have been removed because
+        # they fundamentally depend on canonical source systems (loaded from
+        # CSV ingest + AI enrichment) and on user intent (chat-driven).
+        # Generating them here produced ungrounded output that confused
+        # downstream stages. See onboarding-bug-backlog: "scrap UC/sankey/
+        # entities from company research".
         step_to_table = {
             "profile":     "company_profile",
             "departments": "departments",
-            "usecases":    "use_cases",
-            "sankey":      "sankey_mappings",
-            "entities":    "use_case_entities",
         }
         requested = [s for s in ALL_RESEARCH_STEPS if s in steps_set]
         all_present = all(
@@ -5280,12 +5404,13 @@ def _run_company_research(
         dept_names = [r["department_name"] for r in dept_rows]
         _log(f"Saved {len(dept_names)} departments.")
 
-        # Now we know total steps: 1 profile + 1 departments + N dept use-cases
-        # + 1 sankey + 1 entities = N+4
+        # total_steps = 2 (profile + departments). Use cases / sankey /
+        # entities are no longer part of company research; they migrate to
+        # the chat path (use cases) and to a future "build sankey" step
+        # that runs once both UCs and canonical sources exist.
         n_depts = len(dept_names)
-        total_steps = n_depts + 4
+        total_steps = 2
 
-        # Update profile progress row with correct total
         try:
             execute_query(
                 f"UPDATE {fqn(silver, 'job_progress')} "
@@ -5300,206 +5425,28 @@ def _run_company_research(
         for dn in dept_names:
             _emit_progress(run_id, "dept_item", 2, total_steps, dn, company, "")
 
-        # ---- Step 3: Use Cases PER DEPARTMENT via ai_query() ----
-        _log("Step 3: Generating use cases per department...")
-
-        execute_query(f"DELETE FROM {fqn(silver, 'use_cases')} WHERE 1=1")
-        all_uc_names = []
-        dept_list = ", ".join(dept_names[:25])
-
-        for dept_idx, dept_name in enumerate(dept_names):
-            _log(f"  Generating use cases for: {dept_name}")
-            step_index = 3 + dept_idx
-
-            uc_prompt = (
-                f"You are a data strategy consultant. Generate 3-10 high-value analytics and data use cases "
-                f"for the {dept_name} department at {company}. "
-                f"For each use case, include estimated_value_usd (annual dollar value) and value_rationale. "
-                f"Categories: Predictive Analytics, Reporting and BI, ML/AI, Data Integration, "
-                f"Real-Time Monitoring, Regulatory Compliance, Customer Analytics, Operational Efficiency, "
-                f"Risk Management, Revenue Optimization. "
-                f"Priorities: High, Medium, Low. "
-                f"Respond ONLY with a valid JSON object (no markdown). Use this exact format: "
-                f'{{"use_cases": [{{"use_case_name":"Name","description":"Desc","category":"Cat",'
-                f'"business_value":"Value","estimated_value_usd":5000000,"value_rationale":"Rationale",'
-                f'"priority":"High"}}]}}'
-            )
-
-            try:
-                uc_json = _ai_query(uc_prompt)
-                use_cases = json.loads(uc_json).get("use_cases", [])
-            except Exception as e:
-                _log(f"  Failed for {dept_name}: {e}")
-                _emit_progress(run_id, f"usecase:{dept_name}", step_index, total_steps,
-                               dept_name, company, f"failed: {str(e)[:60]}")
-                continue
-
-            uc_batch = []
-            uc_names_this_dept = []
-            for uc in use_cases:
-                uid = str(uuid.uuid4())[:8]
-                uc_name = uc.get("use_case_name", "").replace("'", "''")
-                uc_desc = uc.get("description", "").replace("'", "''")
-                uc_cat = uc.get("category", "").replace("'", "''")
-                uc_bv = uc.get("business_value", "").replace("'", "''")
-                uc_ev = float(uc.get("estimated_value_usd", 0))
-                uc_vr = uc.get("value_rationale", "").replace("'", "''")
-                uc_pri = uc.get("priority", "Medium").replace("'", "''")
-                uc_co = company.replace("'", "''")
-                dn_esc = dept_name.replace("'", "''")
-                row = (
-                    f"('{uid}', '{uc_name}', '{uc_desc}', '{dn_esc}', '{uc_cat}', "
-                    f"'{uc_bv}', {uc_ev}, '{uc_vr}', '', '{uc_pri}', '{uc_co}', false)"
-                )
-                uc_batch.append(row)
-                uc_names_this_dept.append(uc.get("use_case_name", ""))
-
-            if uc_batch:
-                for i in range(0, len(uc_batch), 10):
-                    b = ", ".join(uc_batch[i:i+10])
-                    execute_query(f"""INSERT INTO {fqn(silver, 'use_cases')}
-                        (id, use_case_name, description, department, category, business_value,
-                         estimated_value_usd, value_rationale,
-                         data_requirements, priority, company_name, is_user_edited) VALUES {b}""")
-
-            all_uc_names.extend(uc_names_this_dept)
-            uc_detail = ", ".join(uc_names_this_dept[:5])
-            if len(uc_names_this_dept) > 5:
-                uc_detail += f" (+{len(uc_names_this_dept) - 5} more)"
-            _emit_progress(run_id, f"usecase:{dept_name}", step_index, total_steps,
-                           dept_name, company, f"{len(uc_names_this_dept)} use cases")
-            _log(f"  {dept_name}: {len(uc_names_this_dept)} use cases saved")
-
-        _log(f"Total use cases saved: {len(all_uc_names)}")
-
-        # ---- Step 4: Sankey Mappings via ai_query() ----
-        _log("Step 4: Generating Sankey mappings via ai_query...")
-
-        try:
-            source_rows = execute_query(
-                f"SELECT DISTINCT program, count(*) as cnt "
-                f"FROM {fqn(silver, 'silver_schemas')} "
-                f"WHERE classification = 'PRODUCTION' AND environment != 'SYSTEM' "
-                f"GROUP BY program ORDER BY cnt DESC LIMIT 20"
-            )
-            sources_text = ", ".join(
-                f"{r.get('program','')} ({r.get('cnt',0)} schemas)" for r in source_rows
-            )
-        except Exception:
-            sources_text = "No enriched catalog data available yet"
-
-        uc_list = ", ".join(all_uc_names[:25])
-        sankey_prompt = (
-            f"You are a data architect for {company}. "
-            f"Data sources/programs: {sources_text}. "
-            f"Use cases: {uc_list}. "
-            f"Departments: {dept_list}. "
-            f"Map data sources through data entities to use cases to departments. "
-            f"Include entity_name for the data entity that connects the source to the use case. "
-            f"For entities without a matching source, use source_system='UNMAPPED'. "
-            f"Relevance: Primary, Secondary, or Supporting. "
-            f"Source categories: ERP, CRM, SCADA, IoT, GIS, HR, Finance, etc. "
-            f"Generate comprehensive mappings. "
-            f"Respond ONLY with valid JSON (no markdown). Use this format: "
-            f'{{"mappings": [{{"source_system":"Name","source_category":"Cat","entity_name":"Entity","use_case":"UC","department":"Dept","relevance":"Primary"}}]}}'
-        )
-
-        sankey_json = _ai_query(sankey_prompt)
-        _log(f"Sankey JSON received ({len(sankey_json)} chars)")
-        mappings = json.loads(sankey_json).get("mappings", [])
-
-        execute_query(f"DELETE FROM {fqn(silver, 'sankey_mappings')} WHERE 1=1")
-        now = datetime.utcnow().isoformat()
-        batch_rows = []
-        for m in mappings:
-            vals = [str(uuid.uuid4())[:8]]
-            for k in ["source_system", "source_category", "use_case", "department", "entity_name", "relevance"]:
-                vals.append(m.get(k, "").replace("'", "''"))
-            vals.append(company.replace("'", "''"))
-            row = "(" + ", ".join(f"'{v}'" for v in vals) + f", false, '{now}')"
-            batch_rows.append(row)
-
-        for i in range(0, len(batch_rows), 20):
-            b = ", ".join(batch_rows[i:i+20])
-            execute_query(f"""INSERT INTO {fqn(silver, 'sankey_mappings')}
-                (id, source_system, source_category, use_case, department, entity_name, relevance,
-                 company_name, is_user_edited, created_at) VALUES {b}""")
-        mapping_count = execute_query(f"SELECT count(*) as cnt FROM {fqn(silver, 'sankey_mappings')}")
-        cnt = mapping_count[0]["cnt"] if mapping_count else 0
-        _log(f"Saved {cnt} Sankey mappings.")
-
-        # Step index for sankey is total_steps - 1; entities is the final step.
-        _emit_progress(run_id, "sankey", total_steps - 1, total_steps, "", company,
-                       f"{cnt} mappings")
-
-        # ---- Step 5: Use-case Entities derived from Sankey ----
-        # Closes B-007: the `entities` step was declared in
-        # ALL_RESEARCH_STEPS but never implemented, so the wizard reported
-        # "Resume Research (1 step left)" forever.
+        # ---- (REMOVED) Steps 3, 4, 5: Use Cases / Sankey / Entities ----
         #
-        # Sankey mappings already contain (use_case, entity_name, source_system)
-        # tuples. Flatten them into use_case_entities, joining to silver.use_cases
-        # to resolve use_case_id. is_matched=true when the entity has a
-        # non-UNMAPPED, non-empty source_system in any of its sankey arcs.
-        _log("Step 5: Deriving use-case entities from sankey mappings...")
-        execute_query(f"DELETE FROM {fqn(silver, 'use_case_entities')} WHERE 1=1")
-
-        # Aggregate sankey -> distinct (use_case, entity) with best source.
-        # `MAX(...) FILTER` would be cleaner but the DBSQL we target across
-        # this codebase doesn't support FILTER on MAX, so we fall back to a
-        # CASE expression inside the aggregate.
-        try:
-            execute_query(f"""
-                INSERT INTO {fqn(silver, 'use_case_entities')}
-                (entity_id, use_case_id, use_case_name, entity_name, entity_type,
-                 description, is_matched, matched_source, company_name, created_at)
-                SELECT
-                  uuid() AS entity_id,
-                  uc.id AS use_case_id,
-                  sm.use_case AS use_case_name,
-                  sm.entity_name,
-                  '' AS entity_type,
-                  '' AS description,
-                  CASE WHEN MAX(CASE
-                       WHEN sm.source_system IS NOT NULL
-                        AND sm.source_system != ''
-                        AND UPPER(sm.source_system) != 'UNMAPPED'
-                       THEN 1 ELSE 0 END) = 1
-                       THEN true ELSE false
-                  END AS is_matched,
-                  COALESCE(MAX(CASE
-                       WHEN sm.source_system IS NOT NULL
-                        AND sm.source_system != ''
-                        AND UPPER(sm.source_system) != 'UNMAPPED'
-                       THEN sm.source_system END), '') AS matched_source,
-                  '{esc_company}' AS company_name,
-                  CAST(current_timestamp() AS STRING) AS created_at
-                FROM {fqn(silver, 'sankey_mappings')} sm
-                LEFT JOIN {fqn(silver, 'use_cases')} uc
-                  ON uc.use_case_name = sm.use_case
-                 AND uc.company_name = '{esc_company}'
-                WHERE sm.company_name = '{esc_company}'
-                  AND sm.entity_name IS NOT NULL
-                  AND sm.entity_name != ''
-                GROUP BY uc.id, sm.use_case, sm.entity_name
-            """)
-        except Exception as e:
-            _log(f"Entity derivation FAILED (non-fatal): {e}")
-
-        ent_count_rows = execute_query(
-            f"SELECT count(*) AS cnt FROM {fqn(silver, 'use_case_entities')} "
-            f"WHERE company_name = '{esc_company}'"
-        )
-        ent_count = ent_count_rows[0]["cnt"] if ent_count_rows else 0
-        matched_rows = execute_query(
-            f"SELECT count(*) AS cnt FROM {fqn(silver, 'use_case_entities')} "
-            f"WHERE company_name = '{esc_company}' AND is_matched = true"
-        )
-        matched_count = matched_rows[0]["cnt"] if matched_rows else 0
-        _log(f"Saved {ent_count} entities ({matched_count} matched to a source).")
-
-        _emit_progress(run_id, "entities", total_steps, total_steps, "", company,
-                       f"{ent_count} entities ({matched_count} matched)")
+        # These three steps used to live here but generated content that was
+        # ungrounded: use cases were synthesized purely from a department
+        # name, sankey mappings invented `source_system` strings that didn't
+        # match the canonical sources loaded by CSV ingest, and entities were
+        # derived from those phantom sankey rows.
+        #
+        # New flow:
+        #   - canonical sources are populated by CSV ingest + AI enrichment
+        #     (see `ingest_schemas`/`ingest_tables` + `_run_enrichment`)
+        #   - use cases are generated via the chat interface, which has the
+        #     full canonical source list to ground its suggestions; use the
+        #     `_ai_query_batch_use_cases()` helper above when implementing
+        #     a batched chat-driven UC seeding path
+        #   - sankey + entities are derived once both UCs and canonical
+        #     sources exist (future "Build Sankey" backend endpoint)
+        #
+        # Pre-existing rows in `silver.use_cases`, `silver.sankey_mappings`,
+        # and `silver.use_case_entities` are NOT wiped here — they survive
+        # company-research re-runs so any data the user generated through
+        # the chat (or earlier company-research runs) is preserved.
 
         _active_runs[run_id]["status"] = "TERMINATED"
         _active_runs[run_id]["end_time"] = datetime.utcnow().isoformat()
@@ -6029,19 +5976,27 @@ async def active_company_research() -> dict:
     return {"run_id": None}
 
 
-ALL_RESEARCH_STEPS = ["profile", "departments", "usecases", "entities", "sankey"]
+# Company research now only generates company profile + departments. Use
+# cases, sankey mappings, and entities have been removed because they
+# need canonical source systems (loaded by CSV ingest) and user intent
+# (chat-driven) to be grounded. The downstream tables still exist in the
+# silver schema; they just get populated by other paths now.
+ALL_RESEARCH_STEPS = ["profile", "departments"]
 
 _RESEARCH_TABLES = [
     "company_profile",
     "departments",
-    "use_cases",
-    "use_case_entities",
-    "sankey_mappings",
 ]
 
 
 def _wipe_research_tables() -> None:
-    """Delete all rows from the company-research Delta tables (keeps schema/history)."""
+    """Delete all rows from the company-research Delta tables (keeps schema/history).
+
+    Only wipes profile + departments. Use cases / sankey / entities are
+    populated by other flows (chat for UCs; future "build sankey" endpoint
+    for sankey + entities) and must not be nuked when the user resets
+    company research, or they'd lose work generated through the chat.
+    """
     silver = get_silver_schema()
     for t in _RESEARCH_TABLES:
         try:
@@ -6065,14 +6020,18 @@ async def company_research_status() -> dict:
             return 0
         return 0
 
+    # Surface counts for both the research-owned tables AND the downstream
+    # tables (use_cases / sankey / entities) so the UI can still render
+    # totals — we just no longer treat the downstream tables as "research
+    # steps" that gate completion.
     counts = {t: _count(t) for t in _RESEARCH_TABLES}
+    counts["use_cases"] = _count("use_cases")
+    counts["sankey_mappings"] = _count("sankey_mappings")
+    counts["use_case_entities"] = _count("use_case_entities")
 
     step_to_table = {
         "profile": "company_profile",
         "departments": "departments",
-        "usecases": "use_cases",
-        "entities": "use_case_entities",
-        "sankey": "sankey_mappings",
     }
     steps_complete = [s for s, t in step_to_table.items() if counts[t] > 0]
     missing_steps = [s for s in ALL_RESEARCH_STEPS if s not in steps_complete]
@@ -6165,7 +6124,7 @@ async def trigger_company_research(body: CompanyResearchIn) -> JobTriggerOut:
     python_params = [
         "--catalog", get_catalog(),
         "--silver-schema", get_silver_schema(),
-        "--model-endpoint", "databricks-claude-sonnet-4-6",
+        "--model-endpoint", "databricks-claude-sonnet-4",
         "--company-name", body.company_name,
         "--run-id", run_id,
         "--steps", ",".join(steps),

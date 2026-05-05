@@ -714,7 +714,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--catalog", default="your_catalog")
     parser.add_argument("--silver-schema", default="bhe_silver")
-    parser.add_argument("--model-endpoint", default="databricks-claude-sonnet-4-6")
+    parser.add_argument("--model-endpoint", default="databricks-claude-sonnet-4")
     parser.add_argument("--company-name", default="Berkshire Hathaway Energy")
     parser.add_argument("--run-id", default="",
                         help="Run ID for progress tracking (passed by the app).")

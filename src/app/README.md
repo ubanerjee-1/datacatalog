@@ -86,7 +86,7 @@ python3 scripts/deploy.py --yes \
 ```
 
 Raw / silver / gold schema names and the LLM endpoint default to
-`bhe_raw` / `bhe_silver` / `bhe_gold` / `databricks-claude-sonnet-4-6`; override
+`bhe_raw` / `bhe_silver` / `bhe_gold` / `databricks-claude-sonnet-4`; override
 with `--raw-schema`, `--silver-schema`, `--gold-schema`, `--llm-endpoint` if
 different. Use `--skip-build` to reuse the last `vite build` and `--skip-grants`
 if the SP already has Unity Catalog privileges.
