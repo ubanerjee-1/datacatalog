@@ -109,19 +109,21 @@ The remaining work from the original plan (chat-driven, source-grounded UC gener
 | | |
 |---|---|
 | **Severity** | Medium (UX confusion + wasted LLM budget) |
-| **Status** | 🟡 **PARTIAL FIX** — short-circuit when complete (Phase 7, 2026-05-05); per-step skip still pending |
-| **Where** | `src/app/src/bhe_catalog/backend/router.py` `_run_company_research` (~line 5125), `trigger_company_research` (~line 6155) |
+| **Status** | ✅ **FIXED** (2026-05-12) |
+| **Where** | `src/app/src/bhe_catalog/backend/router.py` `_run_company_research` (~line 5290), `trigger_company_research` (~line 6254) |
 
-**What's fixed:**
+**Phase 7 (2026-05-05) fixed:**
 - Trigger now passes `steps` and `force_flag` to the inline runner (was previously dropped on the floor — `args=(run_id, body.company_name)`).
 - `_run_company_research` accepts `steps` + `force` parameters and honors them at function entry.
 - Added an "all-requested-steps-complete" short-circuit at the top of the function: if the user clicks Resume after everything is already populated, the function returns immediately instead of re-burning 5+ minutes of LLM calls.
 
-**What's still pending:**
-- Per-step skipping when only a *subset* is missing (e.g. user resumes after sankey failed mid-run). Requires wrapping each of the 5 step bodies in `if _should_run(step, table):` guards — the helper exists, but the existing monolithic step bodies need to be re-indented (deferred to avoid bundling a risky refactor with the other circular-dep fixes).
-- For the common case (research run completes cleanly with the entities step now implemented in B-007), the partial fix is sufficient.
+**2026-05-12 closed the rest:**
+- Each of the three step bodies (profile / departments / affiliates) is now wrapped in `if _should_run(step, table):`. The helper checks both `step in steps_set` AND (`force` OR `_company_count(table) == 0`).
+- When a step is skipped, the runner still emits a `job_progress` row from the existing table state so the UI tree renders the branch as complete during the run.
+- `dept_names` is now re-hydrated from the `departments` table after Step 2 (whether Step 2 ran or was skipped) so downstream progress emits work even when only Step 3 is being resumed.
+- Concrete scenario now handled: profile + departments succeed, affiliates fails, user clicks Resume → frontend posts `steps=["affiliates"]`, runner skips Steps 1-2 (logged) and only burns LLM tokens on Step 3.
 
-**Follow-up effort:** ~45 min to wrap the 5 step bodies + load `dept_names` / `all_uc_names` from DB after their respective steps so a partial-resume can pick up mid-flow.
+**Effort delta:** the original ~45 min estimate assumed 5 step bodies. After the UC/Sankey/entities scrap (2026-05-12 architectural change), only 3 step bodies needed wrapping, so the actual work was ~20 min including the dept-rehydrate + progress-on-skip plumbing.
 
 ---
 
@@ -558,15 +560,14 @@ Seven phases shipped in a single backend-only pass before the fresh-deploy E2E t
 
 If we're picking one PR at a time post-E2E:
 
-1. **B-006 (rest)** — per-step skip when only a subset is missing. ~45 min. Requires re-indenting each of the 5 step bodies in `_run_company_research` under `if _should_run(step, table):` guards and loading `dept_names` / `all_uc_names` from DB after their respective steps. Helper already exists.
-2. **B-008 + B-014 together** (wire 3 orphan jobs into wizard, sequenced in dependency order) — ~2 h, eliminates "now manually trigger 3 jobs in the right order" + makes B-014 invisible.
-3. **Circular dep D** (use_case ID stability across research re-runs) — ~4 h, deterministic IDs + FK cleanup so KB proposal links don't dangle.
-4. **Circular dep E** (silver_schemas vs schema_inventory dual computation of program/zone) — partially mitigated by B-018 (rules now source-of-truth post-populate), but the silver_schemas CTAS still has hardcoded BHE patterns.
-5. **B-003 (rest)** — same LLM-generate-then-MERGE pattern for `program_affiliate_map_seed.csv` and `source_system_canonical_seed.csv` as we did for affiliates in 2026-05-12. ~1.5 h each.
-6. **B-009** (persist run state) — 1 h, nice-to-have until someone hits it in prod.
-7. **B-023** (`bundle destroy` async cleanup) — gather more evidence before fixing.
+1. **B-008 + B-014 together** (wire 3 orphan jobs into wizard, sequenced in dependency order) — ~2 h, eliminates "now manually trigger 3 jobs in the right order" + makes B-014 invisible.
+2. **Circular dep D** (use_case ID stability across research re-runs) — ~4 h, deterministic IDs + FK cleanup so KB proposal links don't dangle.
+3. **Circular dep E** (silver_schemas vs schema_inventory dual computation of program/zone) — partially mitigated by B-018 (rules now source-of-truth post-populate), but the silver_schemas CTAS still has hardcoded BHE patterns.
+4. **B-003 (rest)** — same LLM-generate-then-MERGE pattern for `program_affiliate_map_seed.csv` and `source_system_canonical_seed.csv` as we did for affiliates in 2026-05-12. ~1.5 h each.
+5. **B-009** (persist run state) — 1 h, nice-to-have until someone hits it in prod.
+6. **B-023** (`bundle destroy` async cleanup) — gather more evidence before fixing.
 
-Total for a single "polish iteration": ~3.5 hours of engineering.
+Total for a single "polish iteration": ~3 hours of engineering.
 
 ---
 
@@ -578,6 +579,7 @@ Followups to the 2026-05-05 E2E hardening, all small:
 |---|---|
 | B-003 (affiliates portion) | Affiliates seeded by LLM as Step 3 of company research; `stage_seed_affiliates` retired |
 | B-005 | Superseded — UC generation removed from research; chat-driven and source-grounded going forward |
+| B-006 (rest) | Each step body in `_run_company_research` wrapped in `_should_run`; partial-resume now actually skips completed steps. `dept_names` re-hydrated from DB so progress emits work even when Step 2 is skipped |
 | B-016 | `POST /artifacts` + `ArtifactCreateIn` model + "New" Sheet panel with vocab+filters dropdowns |
 | B-021 | `deploy.py` pre-flight `databricks catalogs get` rejects `MANAGED_ONLINE_CATALOG` early |
 | B-022 | `deploy.py` derives host from `--profile` via `databricks auth describe`, no more redundant `--workspace-url` |

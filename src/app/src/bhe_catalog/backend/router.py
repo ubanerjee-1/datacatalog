@@ -5395,133 +5395,157 @@ def _run_company_research(
             f"DELETE FROM {fqn(silver, 'job_progress')} WHERE run_id = '{_sql_escape(run_id)}'"
         )
 
-        # ---- Step 1: Company Profile via ai_query() ----
-        _log("Step 1: Researching company profile via ai_query...")
-
-        profile_prompt = (
-            f"You are a business analyst specializing in enterprise organizations. "
-            f"Research the company: {company}. Provide a comprehensive profile. "
-            f"For key_business_units and strategic_priorities, return comma-separated strings. "
-            f"For catalog_name, propose a short brand label suitable for the top of an "
-            f"internal data catalog UI (e.g. 'PacifiCorp Data Catalog' or 'NV Energy Data Hub'). "
-            f"For primary_domain, return the company's primary public web domain "
-            f"without a scheme or path (e.g. 'pacificorp.com'). Use the most "
-            f"recognizable corporate domain, not a subsidiary."
-        )
-        profile_resp_fmt = (
-            'STRUCT<profile:STRUCT<company_name:STRING, industry:STRING, sub_industry:STRING, '
-            'description:STRING, headquarters:STRING, '
-            'key_business_units:STRING, strategic_priorities:STRING, '
-            'regulatory_environment:STRING, catalog_name:STRING, primary_domain:STRING>>'
-        )
-
-        profile_json = _ai_query(profile_prompt, profile_resp_fmt)
-        _log(f"Profile JSON received ({len(profile_json)} chars)")
-        profile = json.loads(profile_json)
+        # total_steps is constant now (profile + departments + affiliates).
+        # The original code recomputed it after departments arrived because
+        # use cases / sankey / entities used to expand it per-department —
+        # those steps have been removed.
+        total_steps = 3
 
         def _esc(v):
             if isinstance(v, list):
                 return json.dumps(v).replace("'", "''")
             return str(v).replace("'", "''")
 
-        # Make sure the branding columns exist before we try to write to them
-        # (no-op on fresh installs since bootstrap_tables.py creates them up
-        # front; safety net for existing deployments mid-migration).
-        _ensure_branding_columns()
+        # ---- Step 1: Company Profile via ai_query() ----
+        # Closes B-006 (rest): wrapped in _should_run so a partial-completion
+        # Resume doesn't re-run the profile call when company_profile is
+        # already populated. The previous half-fix only short-circuited when
+        # ALL steps were complete; the middle case (resume after one step
+        # failed) still re-burned tokens on the steps that already succeeded.
+        if _should_run("profile", "company_profile"):
+            _log("Step 1: Researching company profile via ai_query...")
 
-        # Preserve user-edited branding across re-runs. If they've manually
-        # set a catalog_name or logo, leave those alone; otherwise let the AI
-        # suggestion populate them.
-        existing_branding = execute_query(
-            f"SELECT catalog_name, logo_url, primary_domain, branding_user_edited "
-            f"FROM {fqn(silver, 'company_profile')} LIMIT 1"
-        )
-        prev = existing_branding[0] if existing_branding else {}
-        prev_user_edited = bool(prev.get("branding_user_edited") in (True, "true", 1, "1"))
+            profile_prompt = (
+                f"You are a business analyst specializing in enterprise organizations. "
+                f"Research the company: {company}. Provide a comprehensive profile. "
+                f"For key_business_units and strategic_priorities, return comma-separated strings. "
+                f"For catalog_name, propose a short brand label suitable for the top of an "
+                f"internal data catalog UI (e.g. 'PacifiCorp Data Catalog' or 'NV Energy Data Hub'). "
+                f"For primary_domain, return the company's primary public web domain "
+                f"without a scheme or path (e.g. 'pacificorp.com'). Use the most "
+                f"recognizable corporate domain, not a subsidiary."
+            )
+            profile_resp_fmt = (
+                'STRUCT<profile:STRUCT<company_name:STRING, industry:STRING, sub_industry:STRING, '
+                'description:STRING, headquarters:STRING, '
+                'key_business_units:STRING, strategic_priorities:STRING, '
+                'regulatory_environment:STRING, catalog_name:STRING, primary_domain:STRING>>'
+            )
 
-        ai_catalog_name = (profile.get("catalog_name") or "").strip()
-        ai_domain = (profile.get("primary_domain") or "").strip().lower()
-        # Strip any accidental scheme / path from the LLM output before we
-        # build the Clearbit URL.
-        if ai_domain:
-            ai_domain = ai_domain.split("//")[-1].split("/")[0].strip()
-        ai_logo_url = f"https://logo.clearbit.com/{ai_domain}" if ai_domain else ""
+            profile_json = _ai_query(profile_prompt, profile_resp_fmt)
+            _log(f"Profile JSON received ({len(profile_json)} chars)")
+            profile = json.loads(profile_json)
 
-        if prev_user_edited:
-            final_catalog_name = prev.get("catalog_name") or ai_catalog_name or f"{company} Data Catalog"
-            final_logo_url = prev.get("logo_url") or ai_logo_url
-            final_domain = prev.get("primary_domain") or ai_domain
-            _log("Preserving user-edited branding (catalog_name / logo_url).")
+            # Make sure the branding columns exist before we try to write to them
+            # (no-op on fresh installs since bootstrap_tables.py creates them up
+            # front; safety net for existing deployments mid-migration).
+            _ensure_branding_columns()
+
+            # Preserve user-edited branding across re-runs. If they've manually
+            # set a catalog_name or logo, leave those alone; otherwise let the AI
+            # suggestion populate them.
+            existing_branding = execute_query(
+                f"SELECT catalog_name, logo_url, primary_domain, branding_user_edited "
+                f"FROM {fqn(silver, 'company_profile')} LIMIT 1"
+            )
+            prev = existing_branding[0] if existing_branding else {}
+            prev_user_edited = bool(prev.get("branding_user_edited") in (True, "true", 1, "1"))
+
+            ai_catalog_name = (profile.get("catalog_name") or "").strip()
+            ai_domain = (profile.get("primary_domain") or "").strip().lower()
+            # Strip any accidental scheme / path from the LLM output before we
+            # build the Clearbit URL.
+            if ai_domain:
+                ai_domain = ai_domain.split("//")[-1].split("/")[0].strip()
+            ai_logo_url = f"https://logo.clearbit.com/{ai_domain}" if ai_domain else ""
+
+            if prev_user_edited:
+                final_catalog_name = prev.get("catalog_name") or ai_catalog_name or f"{company} Data Catalog"
+                final_logo_url = prev.get("logo_url") or ai_logo_url
+                final_domain = prev.get("primary_domain") or ai_domain
+                _log("Preserving user-edited branding (catalog_name / logo_url).")
+            else:
+                final_catalog_name = ai_catalog_name or f"{company} Data Catalog"
+                final_logo_url = ai_logo_url
+                final_domain = ai_domain
+
+            execute_query(f"DELETE FROM {fqn(silver, 'company_profile')} WHERE 1=1")
+            execute_query(f"""INSERT INTO {fqn(silver, 'company_profile')}
+                (id, company_name, industry, sub_industry, description, headquarters,
+                 key_business_units, strategic_priorities, regulatory_environment,
+                 catalog_name, logo_url, primary_domain, branding_user_edited)
+                VALUES ('{run_id}',
+                    '{_esc(profile.get("company_name", company))}',
+                    '{_esc(profile.get("industry", ""))}',
+                    '{_esc(profile.get("sub_industry", ""))}',
+                    '{_esc(profile.get("description", ""))}',
+                    '{_esc(profile.get("headquarters", ""))}',
+                    '{_esc(profile.get("key_business_units", []))}',
+                    '{_esc(profile.get("strategic_priorities", []))}',
+                    '{_esc(profile.get("regulatory_environment", ""))}',
+                    '{_esc(final_catalog_name)}',
+                    '{_esc(final_logo_url)}',
+                    '{_esc(final_domain)}',
+                    {'true' if prev_user_edited else 'false'})""")
+            _log(f"Company profile saved. Branding: catalog_name='{final_catalog_name}', logo='{final_logo_url}'")
+
+            _emit_progress(run_id, "profile", 1, total_steps, company, "",
+                           profile.get("industry", ""))
         else:
-            final_catalog_name = ai_catalog_name or f"{company} Data Catalog"
-            final_logo_url = ai_logo_url
-            final_domain = ai_domain
-
-        execute_query(f"DELETE FROM {fqn(silver, 'company_profile')} WHERE 1=1")
-        execute_query(f"""INSERT INTO {fqn(silver, 'company_profile')}
-            (id, company_name, industry, sub_industry, description, headquarters,
-             key_business_units, strategic_priorities, regulatory_environment,
-             catalog_name, logo_url, primary_domain, branding_user_edited)
-            VALUES ('{run_id}',
-                '{_esc(profile.get("company_name", company))}',
-                '{_esc(profile.get("industry", ""))}',
-                '{_esc(profile.get("sub_industry", ""))}',
-                '{_esc(profile.get("description", ""))}',
-                '{_esc(profile.get("headquarters", ""))}',
-                '{_esc(profile.get("key_business_units", []))}',
-                '{_esc(profile.get("strategic_priorities", []))}',
-                '{_esc(profile.get("regulatory_environment", ""))}',
-                '{_esc(final_catalog_name)}',
-                '{_esc(final_logo_url)}',
-                '{_esc(final_domain)}',
-                {'true' if prev_user_edited else 'false'})""")
-        _log(f"Company profile saved. Branding: catalog_name='{final_catalog_name}', logo='{final_logo_url}'")
-
-        # Emit profile progress (total_steps is a placeholder — updated after departments known)
-        _emit_progress(run_id, "profile", 1, 5, company, "", profile.get("industry", ""))
+            # Step skipped — emit a progress row so the UI tree still
+            # renders this branch as complete during this run.
+            existing = execute_query(
+                f"SELECT industry FROM {fqn(silver, 'company_profile')} "
+                f"WHERE company_name = '{esc_company}' LIMIT 1"
+            )
+            industry_hint = (existing[0].get("industry") if existing else "") or ""
+            _emit_progress(run_id, "profile", 1, total_steps, company, "", industry_hint)
 
         # ---- Step 2: Departments via ai_query() ----
-        _log("Step 2: Generating departments via ai_query...")
+        if _should_run("departments", "departments"):
+            _log("Step 2: Generating departments via ai_query...")
 
-        dept_prompt = (
-            f"You are a business analyst for large enterprises. "
-            f"Generate 15-25 key departments for {company} relevant to data and analytics. "
-            f"Include both business and technology departments. "
-            f"Return a JSON object with a departments array."
+            dept_prompt = (
+                f"You are a business analyst for large enterprises. "
+                f"Generate 15-25 key departments for {company} relevant to data and analytics. "
+                f"Include both business and technology departments. "
+                f"Return a JSON object with a departments array."
+            )
+            dept_resp_fmt = (
+                'STRUCT<output:STRUCT<departments:ARRAY<STRUCT<'
+                'department_name:STRING, description:STRING, data_needs:STRING'
+                '>>>>'
+            )
+
+            dept_json = _ai_query(dept_prompt, dept_resp_fmt)
+            _log(f"Departments JSON received ({len(dept_json)} chars)")
+            departments = json.loads(dept_json).get("departments", [])
+
+            execute_query(f"DELETE FROM {fqn(silver, 'departments')} WHERE 1=1")
+            dept_batch = []
+            for dept in departments:
+                did = str(uuid.uuid4())[:8]
+                dn = dept.get("department_name", "").replace("'", "''")
+                dd = dept.get("description", "").replace("'", "''")
+                dneeds = dept.get("data_needs", "").replace("'", "''")
+                dept_batch.append(f"('{did}', '{dn}', '{dd}', '', '{dneeds}', '{esc_company}', false)")
+
+            batch = ", ".join(dept_batch)
+            execute_query(f"""INSERT INTO {fqn(silver, 'departments')}
+                (id, department_name, description, key_functions, data_needs, company_name, is_user_edited)
+                VALUES {batch}""")
+            _log(f"Saved {len(departments)} departments (LLM-generated).")
+
+        # Re-hydrate dept_names from DB regardless of whether Step 2 ran.
+        # Step 2 used to keep dept_names as a Python local; under per-step
+        # skip it might be skipped while Step 3 still runs, and the
+        # progress tree needs the department list to render dept_item rows.
+        dept_rows = execute_query(
+            f"SELECT department_name FROM {fqn(silver, 'departments')} "
+            f"WHERE company_name = '{esc_company}'"
         )
-        dept_resp_fmt = (
-            'STRUCT<output:STRUCT<departments:ARRAY<STRUCT<'
-            'department_name:STRING, description:STRING, data_needs:STRING'
-            '>>>>'
-        )
-
-        dept_json = _ai_query(dept_prompt, dept_resp_fmt)
-        _log(f"Departments JSON received ({len(dept_json)} chars)")
-        departments = json.loads(dept_json).get("departments", [])
-
-        execute_query(f"DELETE FROM {fqn(silver, 'departments')} WHERE 1=1")
-        dept_batch = []
-        for dept in departments:
-            did = str(uuid.uuid4())[:8]
-            dn = dept.get("department_name", "").replace("'", "''")
-            dd = dept.get("description", "").replace("'", "''")
-            dneeds = dept.get("data_needs", "").replace("'", "''")
-            dept_batch.append(f"('{did}', '{dn}', '{dd}', '', '{dneeds}', '{esc_company}', false)")
-
-        batch = ", ".join(dept_batch)
-        execute_query(f"""INSERT INTO {fqn(silver, 'departments')}
-            (id, department_name, description, key_functions, data_needs, company_name, is_user_edited)
-            VALUES {batch}""")
-        dept_rows = execute_query(f"SELECT department_name FROM {fqn(silver, 'departments')}")
         dept_names = [r["department_name"] for r in dept_rows]
-        _log(f"Saved {len(dept_names)} departments.")
-
-        # total_steps = 3 (profile + departments + affiliates). Use cases /
-        # sankey / entities are no longer part of company research; they
-        # migrate to the chat path (use cases) and to a future "build sankey"
-        # step that runs once both UCs and canonical sources exist.
         n_depts = len(dept_names)
-        total_steps = 3
 
         try:
             execute_query(
@@ -5544,7 +5568,7 @@ def _run_company_research(
         # is_user_edited=true are preserved across re-runs (matches the
         # build_value_model.py contract). Replaces the legacy CSV-seeded
         # path (closes B-003).
-        if "affiliates" in steps_set:
+        if _should_run("affiliates", "affiliates"):
             _log("Step 3: Generating affiliates via ai_query...")
             try:
                 affiliates = _ai_query_generate_affiliates(company)
@@ -5608,7 +5632,12 @@ def _run_company_research(
                            f"{aff_count} affiliates")
             _log(f"Saved {aff_count} affiliates (after MERGE).")
         else:
-            _log("Skipping affiliates step (not in requested step list)")
+            # Step skipped (not requested or already populated). Still emit
+            # progress so the UI shows this branch as complete during this
+            # run; pull the current count from the table for accurate detail.
+            aff_count = _company_count("affiliates")
+            _emit_progress(run_id, "affiliates", 3, total_steps, "", company,
+                           f"{aff_count} affiliates")
 
         # ---- (REMOVED) Steps 3, 4, 5: Use Cases / Sankey / Entities ----
         #
