@@ -31,13 +31,28 @@ from typing import Any
 import requests
 from pydantic import BaseModel, Field
 
+from ..app_config import get_config_value
 from ..db import _get_headers, _get_host
 from ._base import Tool, ToolContext, ToolResult
 
 logger = logging.getLogger(__name__)
 
 
-GENIE_SPACE_ID = os.environ.get("GENIE_SPACE_ID", "01f13f2d12271caeb5f26d3762ea9d75")
+def _resolve_genie_space_id() -> str:
+    """Resolve the Genie space ID at request time.
+
+    Priority:
+      1. `app_config` table (key `genie_space_id`). The in-app Setup Wizard's
+         "Deploy Genie Space" step writes here, so re-deploys are picked up
+         without an app restart.
+      2. `GENIE_SPACE_ID` env var (set in app.yml at deploy time, useful for
+         pre-provisioned spaces).
+      3. Empty string -- the chatbot surfaces "not configured" to the user.
+    """
+    v = get_config_value("genie_space_id")
+    if v:
+        return v
+    return os.environ.get("GENIE_SPACE_ID", "").strip()
 
 # Polling parameters. Genie can be slow on cold starts (warehouse spinup +
 # LLM gen). 90s is generous; we surface progress to the chat as a single
@@ -153,11 +168,15 @@ def _summarize_result(result: dict | None) -> tuple[list[dict], list[str]]:
 
 
 def _genie_ask(args: GenieAskArgs, ctx: ToolContext) -> ToolResult:
-    space_id = GENIE_SPACE_ID
+    space_id = _resolve_genie_space_id()
     if not space_id:
         return ToolResult(
             ok=False,
-            summary="Genie space is not configured (set GENIE_SPACE_ID).",
+            summary=(
+                "Genie space is not configured. Open the Company Setup page "
+                "and click 'Deploy Genie Space' to create one, or set "
+                "GENIE_SPACE_ID in src/app/app.yml."
+            ),
             data={"error": "no_space_id"},
         )
 

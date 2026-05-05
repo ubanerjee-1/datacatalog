@@ -43,10 +43,25 @@ export interface SetupStatus {
   };
   data: { ok: boolean; counts: Record<string, number> };
   company: { present: boolean; company_name: string };
+  genie: {
+    deployable: boolean;
+    deployed: boolean;
+    space_id: string;
+    url: string;
+    source: "" | "app_config" | "env";
+  };
   grants_sql: string[];
   is_setup_ready: boolean;
   is_data_ready: boolean;
   is_complete: boolean;
+}
+
+export interface GenieDeployResult {
+  space_id: string;
+  mode: "created" | "updated";
+  tables: number;
+  example_questions: number;
+  url: string;
 }
 
 export async function fetchSetupStatus(): Promise<SetupStatus> {
@@ -61,6 +76,15 @@ export async function bootstrapSchemas() {
 
 export async function bootstrapTables() {
   const { data } = await api.post("/setup/bootstrap-tables");
+  return data;
+}
+
+export async function deployGenieSpace(
+  options?: { forceNew?: boolean },
+): Promise<GenieDeployResult> {
+  const { data } = await api.post("/setup/deploy-genie-space", null, {
+    params: options?.forceNew ? { force_new: true } : undefined,
+  });
   return data;
 }
 

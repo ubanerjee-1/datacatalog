@@ -3,6 +3,7 @@ __pycache__/
 .DS_Store
 node_modules/
 dist/
+__dist__/
 .venv/
 *.egg-info/
 .databricks/
@@ -15,3 +16,10 @@ scratch_*.py
 analyze_data.py
 .cursor/
 .vscode/
+
+# Local env overrides and personal push helpers (NEVER commit)
+.env.local
+.env.*
+!.env.example
+.git-push.sh
+.netrc

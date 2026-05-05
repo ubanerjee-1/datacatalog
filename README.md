@@ -257,17 +257,20 @@ wizard with the following steps:
 
 | Step | What happens |
 |------|--------------|
-| **Setup overview banner** | 8 colored pills at the top — `Config / Warehouse / Catalog / LLM / Schemas / Tables / Data / Company`. Green = ready, red = blocking |
+| **Setup overview banner** | 9 colored pills at the top — `Config / Warehouse / Catalog / LLM / Schemas / Tables / Genie / Data / Company`. Green = ready, red = blocking |
 | **Step 1 — Environment & Identity** | Read-only confirmation of the env vars in `app.yml`, plus the running service principal's identity (the user/SP the app authenticates as) |
 | **Step 2 — Catalog, Warehouse & LLM Access** | Three live probes: `SELECT 1` on the warehouse, `SHOW SCHEMAS IN <catalog>`, and `ai_query('<endpoint>', …)`. If any fail, **a copy-pastable `GRANT` SQL block appears** that you can run as a metastore admin in the Databricks SQL editor |
-| **Step 3 — Database Bootstrap** | Click one button to `CREATE SCHEMA IF NOT EXISTS` (raw / silver / gold) and `CREATE TABLE IF NOT EXISTS` for all 16 required tables. Idempotent — safe to re-run |
-| **Step 4 — Company Intelligence** | Locked until step 3 is green. Type your company name → AI generates departments, use cases with $ values, required data entities, source-system Sankey mappings |
-| **Step 5 — Data Sources** | Locked until step 3 is green. Download the schema-extractor utility (in `schema-extractor/`), run it across your workspaces, upload the resulting `all_schemas.csv` + `all_tables.csv` |
-| **Step 6 — Enrichment Pipeline** | Locked until data is ingested. One-click "Run All (Sequential)": Populate Gold → AI Enrich Schemas → AI Enrich Tables → Generate Taxonomy |
+| **Step 3 — Database Bootstrap** | Click one button to `CREATE SCHEMA IF NOT EXISTS` (raw / silver / gold) and `CREATE TABLE IF NOT EXISTS` for all required tables (including `bhe_gold.app_config`, the runtime key/value store the wizard uses). Idempotent — safe to re-run |
+| **Step 4 — Deploy Genie Space** *(optional)* | Locked until step 3 is green. One click: substitutes your catalog into the canonical JSON template, calls `POST /api/2.0/genie/spaces` (or `PATCH` if already deployed), and persists the returned `space_id` to `bhe_gold.app_config` so the chatbot's `genie_ask` fallback tool resolves it at runtime without an app restart |
+| **Step 5 — Company Intelligence** | Locked until step 3 is green. Type your company name → AI generates departments, use cases with $ values, required data entities, source-system Sankey mappings |
+| **Step 6 — Data Sources** | Locked until step 3 is green. Download the schema-extractor utility (in `schema-extractor/`), run it across your workspaces, upload the resulting `all_schemas.csv` + `all_tables.csv` |
+| **Step 7 — Enrichment Pipeline** | Locked until data is ingested. One-click "Run All (Sequential)": Populate Gold → AI Enrich Schemas → AI Enrich Tables → Generate Taxonomy |
 | **Danger Zone** | Collapsed at the bottom. Type the catalog name to enable a `DROP SCHEMA … CASCADE` for all 3 schemas — full reset |
 
-You'll know setup is fully complete when all 8 pills are green and the
-home page redirects to `/dashboard` instead of `/company`.
+You'll know setup is fully complete when all 9 pills are green and the
+home page redirects to `/dashboard` instead of `/company`. (The `Genie`
+pill is optional — the chatbot's typed `app_*` tools work without it; only
+the free-form `genie_ask` fallback needs the Genie space.)
 
 ### What if I don't want to grant the GRANTs the wizard suggests?
 

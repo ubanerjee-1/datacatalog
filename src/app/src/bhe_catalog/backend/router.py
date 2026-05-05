@@ -16,6 +16,7 @@ from typing import Optional
 from fastapi import HTTPException, Query, UploadFile, File, Form
 from fastapi.responses import StreamingResponse
 
+from . import app_config, setup_genie
 from .chat import chat_router
 from .confirm import confirm_router
 from .core import Dependencies, create_router
@@ -268,6 +269,52 @@ def me(headers: HeadersDependency):
 # the ingest endpoints (CTAS from Volume CSVs) and don't have a fixed schema
 # we want to commit to here.
 _SETUP_SILVER_DDL: dict[str, str] = {
+    # Schema-grain catalog inventory loaded from the schema-extractor CSV.
+    # Pre-creating here lets `ingest_schemas` MERGE into the table instead of
+    # DROP+CTAS, which preserves ALTER-added columns and user-edited rows
+    # across re-ingests. See onboarding-bug-backlog "Circular dep B".
+    "silver_schemas": """CREATE TABLE IF NOT EXISTS {fqn} (
+        catalog_name STRING NOT NULL,
+        schema_name STRING NOT NULL,
+        schema_owner STRING,
+        comment STRING,
+        created STRING,
+        last_altered STRING,
+        workspace_url STRING,
+        environment STRING,
+        zone STRING,
+        program STRING,
+        classification STRING,
+        ai_definition STRING,
+        business_friendly_name STRING,
+        suggested_department STRING,
+        suggested_domain STRING,
+        data_sensitivity STRING,
+        is_user_edited BOOLEAN,
+        user_edited_at STRING
+    ) USING DELTA COMMENT 'Silver: schema-grain catalog inventory ingested from extractor CSV'""",
+    # Table-grain inventory. `source_system` / `source_system_canonical` are
+    # included from day-one so the normalize_source_systems job's ALTER+MERGE
+    # is a no-op on a fresh deploy and the read paths (Schema Explorer,
+    # Source Systems) work pre-normalize. Closes B-017.
+    "silver_tables": """CREATE TABLE IF NOT EXISTS {fqn} (
+        table_catalog STRING NOT NULL,
+        table_schema STRING NOT NULL,
+        table_name STRING NOT NULL,
+        table_type STRING,
+        table_owner STRING,
+        comment STRING,
+        created STRING,
+        last_altered STRING,
+        data_source_format STRING,
+        classification STRING,
+        ai_definition STRING,
+        business_friendly_name STRING,
+        is_user_edited BOOLEAN,
+        user_edited_at STRING,
+        source_system STRING COMMENT 'Raw value populated by normalize_source_systems job',
+        source_system_canonical STRING COMMENT 'Resolved canonical populated by normalize_source_systems job'
+    ) USING DELTA COMMENT 'Silver: table-grain catalog inventory ingested from extractor CSV'""",
     "company_profile": """CREATE TABLE IF NOT EXISTS {fqn} (
         id STRING, company_name STRING, industry STRING, sub_industry STRING,
         description STRING, headquarters STRING, key_business_units STRING,
@@ -336,6 +383,12 @@ _SETUP_SILVER_DDL: dict[str, str] = {
 }
 
 _SETUP_GOLD_DDL: dict[str, str] = {
+    "app_config": """CREATE TABLE IF NOT EXISTS {fqn} (
+        key STRING NOT NULL,
+        value STRING,
+        updated_at TIMESTAMP,
+        updated_by STRING
+    ) USING DELTA COMMENT 'Runtime key/value config written by the in-app Setup Wizard (e.g. genie_space_id)'""",
     "schema_inventory": """CREATE TABLE IF NOT EXISTS {fqn} (
         schema_key STRING, workspace_id STRING, workspace_url STRING,
         workspace_name STRING, catalog_name STRING, schema_name STRING,
@@ -375,7 +428,113 @@ _SETUP_GOLD_DDL: dict[str, str] = {
         programs ARRAY<STRING>, zones ARRAY<STRING>, environments ARRAY<STRING>,
         sample_table_names ARRAY<STRING>, updated_at TIMESTAMP
     ) USING DELTA""",
+    # User-editable parsing rules: catalog/schema names -> programs, environments,
+    # zones, ignore lists. Read by `_load_rules()` during populate_gold; edited
+    # via the /rules page. The wizard seeds universal ignore patterns into this
+    # table after creation (see `_seed_classification_rules_if_empty()`).
+    "classification_rules": """CREATE TABLE IF NOT EXISTS {fqn} (
+        rule_id STRING NOT NULL,
+        category STRING NOT NULL COMMENT 'program | zone | environment | ignore_catalog | ignore_schema | federated_source',
+        pattern STRING NOT NULL COMMENT 'glob pattern matched against catalog/schema name',
+        label STRING COMMENT 'canonical name produced when pattern matches (empty for ignore rules)',
+        description STRING,
+        metadata STRING COMMENT 'JSON blob (e.g. affiliate name for program rules)',
+        is_active BOOLEAN,
+        display_order INT,
+        created_at TIMESTAMP,
+        updated_at TIMESTAMP
+    ) USING DELTA COMMENT 'Gold layer: parsing rules driving schema_inventory classification'""",
+    # AI-classified taxonomy dimensions per schema. Written by Generate
+    # Taxonomy job; read by Schema Explorer / Analytics. SCD Type 2 via
+    # effective_from / effective_to.
+    "schema_taxonomy": """CREATE TABLE IF NOT EXISTS {fqn} (
+        taxonomy_id STRING,
+        schema_key STRING NOT NULL,
+        dimension STRING NOT NULL,
+        value STRING,
+        source STRING,
+        confidence FLOAT,
+        ai_reasoning STRING,
+        effective_from TIMESTAMP,
+        effective_to TIMESTAMP,
+        created_by STRING,
+        created_at TIMESTAMP
+    ) USING DELTA COMMENT 'Gold layer: AI taxonomy classification across 8 dimensions per schema'""",
+    # Customer-editable affiliates (operating subsidiaries). Seeded by
+    # `bhe_build_value_model` job from src/data/affiliates_seed.csv; the job
+    # also has a CREATE TABLE IF NOT EXISTS, so pre-creating here is a no-op
+    # for that job but unblocks Edit Center / Value & Readiness pages on a
+    # fresh deploy.
+    "affiliates": """CREATE TABLE IF NOT EXISTS {fqn} (
+        affiliate_name STRING NOT NULL COMMENT 'Canonical affiliate name (primary key)',
+        affiliate_code STRING COMMENT 'Short code (PAC, NVE, MEC, ...)',
+        business_type STRING COMMENT 'electric_utility | electric_gas_utility | renewables_developer | natural_gas_pipeline | corporate | ...',
+        region STRING COMMENT 'Geographic footprint',
+        description STRING,
+        is_active BOOLEAN,
+        is_user_edited BOOLEAN COMMENT 'true = manual edit; never overwritten by job',
+        created_at TIMESTAMP,
+        updated_at TIMESTAMP
+    ) USING DELTA COMMENT 'Gold layer: operating affiliates (customer-editable)'""",
+    "program_affiliate_map": """CREATE TABLE IF NOT EXISTS {fqn} (
+        program STRING NOT NULL COMMENT 'silver_schemas.program value',
+        affiliate_name STRING NOT NULL COMMENT 'FK -> affiliates.affiliate_name',
+        affiliation_strength STRING COMMENT 'primary | secondary',
+        notes STRING,
+        is_user_edited BOOLEAN,
+        updated_at TIMESTAMP
+    ) USING DELTA COMMENT 'Gold layer: bridge program -> affiliate (M:N)'""",
+    "use_case_source_requirements": """CREATE TABLE IF NOT EXISTS {fqn} (
+        use_case_id STRING NOT NULL COMMENT 'FK -> use_cases.id',
+        required_canonical STRING NOT NULL COMMENT 'FK -> source_system_canonical.canonical, or "Unmapped"',
+        necessity STRING COMMENT 'must_have | nice_to_have',
+        data_need_excerpt STRING COMMENT 'Source phrase from data_requirements that triggered the mapping',
+        confidence STRING COMMENT 'high | med | low',
+        mapped_by STRING COMMENT 'llm | manual',
+        is_user_edited BOOLEAN,
+        mapped_at TIMESTAMP
+    ) USING DELTA COMMENT 'Gold layer: use case -> required source systems (LLM mapped, analyst-overridable)'""",
+    "use_case_affiliates": """CREATE TABLE IF NOT EXISTS {fqn} (
+        use_case_id STRING NOT NULL COMMENT 'FK -> use_cases.id',
+        affiliate_name STRING NOT NULL COMMENT 'FK -> affiliates.affiliate_name',
+        applicability STRING COMMENT 'primary | secondary',
+        rationale STRING,
+        mapped_by STRING COMMENT 'llm | manual',
+        is_user_edited BOOLEAN,
+        mapped_at TIMESTAMP
+    ) USING DELTA COMMENT 'Gold layer: use case -> applicable affiliates (LLM mapped, analyst-overridable)'""",
+    "source_system_canonical": """CREATE TABLE IF NOT EXISTS {fqn} (
+        canonical STRING NOT NULL COMMENT 'Canonical source-system name (primary key)',
+        category STRING COMMENT 'Category bucket (ERP, CIS, Historian, ...)',
+        description STRING,
+        is_active BOOLEAN,
+        created_at TIMESTAMP,
+        updated_at TIMESTAMP
+    ) USING DELTA COMMENT 'Gold layer: customer-editable canonical source systems'""",
+    "source_system_aliases": """CREATE TABLE IF NOT EXISTS {fqn} (
+        raw STRING NOT NULL COMMENT 'Source-system value as it appears in silver_tables (primary key)',
+        raw_normalized STRING COMMENT 'lower(trim(raw)) for case-insensitive matching',
+        canonical STRING COMMENT 'Resolved canonical name (FK to source_system_canonical)',
+        mapped_by STRING COMMENT 'seed | exact | normalized | alias_seed | llm | manual | fallback_other',
+        confidence STRING COMMENT 'high | med | low | NULL',
+        mapped_at TIMESTAMP,
+        is_user_edited BOOLEAN
+    ) USING DELTA COMMENT 'Gold layer: persistent raw->canonical source-system mapping'""",
 }
+
+
+# Universal ignore-rule seeds for `classification_rules`. These mirror the
+# hardcoded filters in `bootstrap_tables.py` and are safe across all customers
+# (Databricks platform internals + INFORMATION_SCHEMA). Customer-specific
+# program / zone / environment rules are NOT seeded — those are added via the
+# /rules UI as the user discovers their conventions.
+_CLASSIFICATION_RULES_SEED: list[dict] = [
+    {"rule_id": "ig_dbx", "category": "ignore_catalog", "pattern": "__databricks_internal_*", "label": "", "description": "Databricks platform internals", "display_order": 10},
+    {"rule_id": "ig_sys", "category": "ignore_catalog", "pattern": "system",                  "label": "", "description": "Databricks system catalog",    "display_order": 11},
+    {"rule_id": "ig_smp", "category": "ignore_catalog", "pattern": "samples",                 "label": "", "description": "Databricks sample data",       "display_order": 12},
+    {"rule_id": "ig_inf", "category": "ignore_schema",  "pattern": "information_schema",      "label": "", "description": "INFORMATION_SCHEMA metadata",  "display_order": 10},
+    {"rule_id": "ig_def", "category": "ignore_schema",  "pattern": "default",                 "label": "", "description": "Empty default schema",         "display_order": 11},
+]
 
 
 def _resolve_app_identity() -> dict:
@@ -520,6 +679,30 @@ async def setup_status() -> dict:
         schemas_check_msg = "Skipped (catalog unreachable)"
     schemas_ok = catalog_access["ok"] and all(schemas_state.values())
 
+    # Volume present? CSV ingest + branding logo upload + seed data all
+    # depend on `<raw_schema>.uploads`. Probe via information_schema.volumes
+    # so a missing volume becomes a visible "ok=false" instead of a confusing
+    # 502 the first time the user clicks "Upload".
+    volume_state = {"uploads": False}
+    volume_msg = ""
+    if schemas_state.get(raw_schema):
+        try:
+            rows = execute_query(
+                f"SELECT volume_name FROM `{catalog}`.information_schema.volumes "
+                f"WHERE volume_schema = '{raw_schema}' AND volume_name = 'uploads'",
+                tag_overrides={"submodule": "setup_probe_volume"},
+            )
+            volume_state["uploads"] = bool(rows)
+            volume_msg = (
+                f"`{raw_schema}.uploads` exists" if volume_state["uploads"]
+                else f"Missing volume `{raw_schema}.uploads` — re-run Bootstrap Schemas"
+            )
+        except Exception as e:
+            volume_msg = f"Could not probe volumes: {e}"
+    else:
+        volume_msg = "Skipped (raw schema missing)"
+    volume_ok = volume_state["uploads"]
+
     # Tables present? Only check the schemas that exist.
     silver_present: list[str] = []
     silver_missing: list[str] = []
@@ -592,6 +775,38 @@ async def setup_status() -> dict:
         except Exception:
             pass
 
+    # Genie space: deployable only after gold tables exist (the space's
+    # data_sources reference bhe_silver/bhe_gold). Status is informational --
+    # the chatbot's app_* tools work without Genie; only the `genie_ask`
+    # fallback tool needs it.
+    genie_state: dict = {
+        "deployable": "app_config" in gold_present,
+        "deployed": False,
+        "space_id": "",
+        "url": "",
+        "source": "",
+    }
+    # Prefer the runtime config table (where the wizard writes); fall back to
+    # the app.yml env var (where deploy-time overrides go).
+    space_id = ""
+    if "app_config" in gold_present:
+        try:
+            v = app_config.get_config_value("genie_space_id")
+            if v:
+                space_id = v
+                genie_state["source"] = "app_config"
+        except Exception:
+            pass
+    if not space_id:
+        env_id = os.environ.get("GENIE_SPACE_ID", "").strip()
+        if env_id:
+            space_id = env_id
+            genie_state["source"] = "env"
+    if space_id:
+        genie_state["deployed"] = True
+        genie_state["space_id"] = space_id
+        genie_state["url"] = f"{host.rstrip('/')}/genie/rooms/{space_id}" if host else ""
+
     # Build the GRANT statements an admin can copy/paste. Identifier-quote
     # everything; principal_id is either an email (humans) or UUID (SPs).
     sp_principal = identity.get("user_name") or identity.get("client_id") or "<service-principal-id>"
@@ -618,10 +833,10 @@ async def setup_status() -> dict:
             f"--json '{{\"access_control_list\":[{{\"service_principal_name\":\"{sp_principal}\",\"permission_level\":\"CAN_QUERY\"}}]}}')."
         )
 
-    # Overall status: tier 1 = identity + warehouse + catalog + llm, tier 2 = schemas + tables
+    # Overall status: tier 1 = identity + warehouse + catalog + llm, tier 2 = schemas + volume + tables
     is_setup_ready = (
         config_ok and warehouse["ok"] and catalog_access["ok"] and llm_access["ok"]
-        and schemas_ok and tables_ok
+        and schemas_ok and volume_ok and tables_ok
     )
     is_data_ready = is_setup_ready and data_ok
     is_complete = is_data_ready and company["present"]
@@ -638,6 +853,11 @@ async def setup_status() -> dict:
             "message": schemas_check_msg,
             "state": schemas_state,
         },
+        "volume": {
+            "ok": volume_ok,
+            "message": volume_msg,
+            "state": volume_state,
+        },
         "tables": {
             "ok": tables_ok,
             "silver_present": silver_present,
@@ -650,6 +870,7 @@ async def setup_status() -> dict:
             "counts": data_counts,
         },
         "company": company,
+        "genie": genie_state,
         "grants_sql": grants_sql,
         "is_setup_ready": is_setup_ready,
         "is_data_ready": is_data_ready,
@@ -659,14 +880,22 @@ async def setup_status() -> dict:
 
 @router.post("/setup/bootstrap-schemas", operation_id="setupBootstrapSchemas")
 async def setup_bootstrap_schemas() -> dict:
-    """Create the raw / silver / gold schemas in the configured catalog.
+    """Create the raw / silver / gold schemas + the uploads Volume.
 
-    Idempotent (CREATE SCHEMA IF NOT EXISTS). Fails fast with a clear error
-    if the service principal lacks CREATE SCHEMA on the catalog.
+    Idempotent (CREATE SCHEMA / VOLUME IF NOT EXISTS). Fails fast with a clear
+    error if the service principal lacks CREATE SCHEMA on the catalog.
+
+    The `uploads` Volume in the raw schema is required for *every* CSV ingest
+    (schema-extractor output, affiliate seeds, branding logos). Creating it
+    here means a fresh wizard run on a brand-new catalog leaves the user able
+    to upload — without requiring them to also run `scripts/deploy.py`. See
+    onboarding-bug-backlog B-013.
     """
     catalog = get_catalog()
-    schemas = [get_raw_schema(), get_silver_schema(), get_gold_schema()]
-    created = []
+    raw_schema = get_raw_schema()
+    schemas = [raw_schema, get_silver_schema(), get_gold_schema()]
+    created: list[str] = []
+    created_volumes: list[str] = []
     failed: list[dict] = []
     for sch in schemas:
         try:
@@ -677,6 +906,22 @@ async def setup_bootstrap_schemas() -> dict:
             created.append(sch)
         except Exception as e:
             failed.append({"schema": sch, "error": str(e)[:400]})
+
+    # Volume creation is best-effort: if the raw schema didn't get created we
+    # can't create the volume in it; log to `failed` and let the wizard
+    # surface it. If the raw schema *did* get created, missing CREATE_VOLUME
+    # privilege on it is a separate (and recoverable) error.
+    if raw_schema in created:
+        try:
+            execute_update(
+                f"CREATE VOLUME IF NOT EXISTS `{catalog}`.`{raw_schema}`.`uploads` "
+                f"COMMENT 'Landing zone for schema-extractor CSVs and seed data uploads'",
+                tag_overrides={"submodule": "setup_create_volume_uploads"},
+            )
+            created_volumes.append(f"{raw_schema}.uploads")
+        except Exception as e:
+            failed.append({"volume": f"{raw_schema}.uploads", "error": str(e)[:400]})
+
     if failed and not created:
         raise HTTPException(
             status_code=403,
@@ -688,7 +933,12 @@ async def setup_bootstrap_schemas() -> dict:
                 "failed": failed,
             },
         )
-    return {"catalog": catalog, "created": created, "failed": failed}
+    return {
+        "catalog": catalog,
+        "created": created,
+        "created_volumes": created_volumes,
+        "failed": failed,
+    }
 
 
 @router.post("/setup/bootstrap-tables", operation_id="setupBootstrapTables")
@@ -727,6 +977,10 @@ async def setup_bootstrap_tables() -> dict:
         except Exception as e:
             failed.append({"table": f"{gold}.{table}", "error": str(e)[:400]})
 
+    seeded_rules = 0
+    if f"{gold}.classification_rules" in created:
+        seeded_rules = _seed_classification_rules_if_empty(gold)
+
     if failed and not created:
         raise HTTPException(
             status_code=403,
@@ -738,7 +992,76 @@ async def setup_bootstrap_tables() -> dict:
                 "failed": failed,
             },
         )
-    return {"catalog": catalog, "created": created, "failed": failed}
+    return {
+        "catalog": catalog,
+        "created": created,
+        "failed": failed,
+        "seeded_classification_rules": seeded_rules,
+    }
+
+
+@router.post("/setup/deploy-genie-space", operation_id="setupDeployGenie")
+async def setup_deploy_genie_space(
+    force_new: bool = Query(
+        False,
+        description=(
+            "If true, ignore any existing space ID (in app_config or env) and "
+            "create a fresh Genie space. Use after a PATCH failure that the "
+            "user wants to recover from by abandoning the old space."
+        ),
+    ),
+) -> dict:
+    """Create-or-update the BHE Catalog Explorer Genie space.
+
+    Reads the canonical space JSON, substitutes the running app's catalog
+    and silver/gold schema names into every table identifier, and POSTs (or
+    PATCHes) to the Genie REST API. The returned `space_id` is persisted to
+    `<gold>.app_config` so the chatbot's `genie_ask` tool resolves it at
+    request time without an app restart.
+
+    Prerequisites: silver + gold schemas exist and `app_config` table has
+    been bootstrapped. Returns 412 with a remediation hint otherwise.
+    """
+    catalog = get_catalog()
+    gold = get_gold_schema()
+
+    # Probe app_config: required for persisting the returned space_id.
+    try:
+        execute_query(
+            f"SELECT 1 FROM `{catalog}`.`{gold}`.app_config LIMIT 1",
+            tag_overrides={"submodule": "setup_genie_probe_app_config"},
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=412,
+            detail={
+                "message": (
+                    "The `app_config` table doesn't exist yet. Click "
+                    "'Create database tables' in the Setup Wizard first, "
+                    "then re-try."
+                ),
+                "table": f"{catalog}.{gold}.app_config",
+                "error": str(e)[:300],
+            },
+        )
+
+    # Resolve principal for the audit column on app_config writes.
+    identity = _resolve_app_identity()
+    principal = identity.get("user_name") or identity.get("client_id") or "app"
+
+    try:
+        result = setup_genie.deploy_genie_space(
+            principal=principal, force_new=force_new
+        )
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=500, detail={"message": str(e)})
+    except RuntimeError as e:
+        raise HTTPException(status_code=502, detail={"message": str(e)[:600]})
+    except Exception as e:
+        logger.exception("Genie deploy failed")
+        raise HTTPException(status_code=500, detail={"message": str(e)[:600]})
+
+    return result
 
 
 @router.post("/setup/nuke", operation_id="setupNuke")
@@ -1319,6 +1642,72 @@ def _ensure_use_case_status_columns() -> None:
         logger.warning(f"_ensure_use_case_status_columns failed: {e}")
 
 
+# ---------------------------------------------------------------------------
+# Defensive ALTER for silver_tables source-system columns.
+#
+# `silver_tables` is created by `bootstrap_tables` via CTAS from the
+# schema-extractor CSV. The CTAS does *not* project `source_system` or
+# `source_system_canonical` — those columns are added later by the
+# `normalize_source_systems` job via DESCRIBE+ALTER.
+#
+# But several read paths (analytics_schema_tables, list_source_systems,
+# source_system_detail) reference `silver_tables.source_system` directly.
+# Without the normalize job having run, those queries 500 with
+# UNRESOLVED_COLUMN. This helper is the same pattern as
+# `_ensure_use_case_status_columns()` above and lets the read paths render
+# (with NULL values) before the normalize job has run.
+#
+# B-017 in onboarding-bug-backlog.md.
+# ---------------------------------------------------------------------------
+_SILVER_TABLES_SOURCE_COLUMNS_READY = False
+
+
+def _ensure_silver_tables_columns() -> None:
+    """Idempotently add `source_system` / `source_system_canonical` to silver_tables.
+
+    Safe to call repeatedly; uses a process-local flag to avoid issuing DDL on
+    every request after the first success. Failures (e.g. table doesn't exist
+    yet, token expired) are logged but never raised so the caller can still
+    return a sensible response — the underlying SQL will simply fail on the
+    missing column with a clearer error than the user would otherwise see.
+    """
+    global _SILVER_TABLES_SOURCE_COLUMNS_READY
+    if _SILVER_TABLES_SOURCE_COLUMNS_READY:
+        return
+    silver = get_silver_schema()
+    tbl = fqn(silver, "silver_tables")
+    try:
+        rows = execute_query(
+            f"DESCRIBE TABLE {tbl}",
+            tag_overrides={"submodule": "ensure_silver_tables_cols_describe"},
+        )
+        existing = {
+            (r.get("col_name") or "").lower()
+            for r in rows or []
+            if r.get("col_name") and not str(r.get("col_name")).startswith("#")
+        }
+        to_add: list[str] = []
+        if "source_system" not in existing:
+            to_add.append(
+                "source_system STRING COMMENT 'Raw source-system value (added by normalize_source_systems job)'"
+            )
+        if "source_system_canonical" not in existing:
+            to_add.append(
+                "source_system_canonical STRING COMMENT 'Resolved canonical name (added by normalize_source_systems job)'"
+            )
+        if to_add:
+            execute_update(
+                f"ALTER TABLE {tbl} ADD COLUMNS (" + ", ".join(to_add) + ")",
+                tag_overrides={"submodule": "ensure_silver_tables_cols_alter"},
+            )
+            logger.info(
+                "Added silver_tables columns: %s", ", ".join(c.split(' ', 1)[0] for c in to_add)
+            )
+        _SILVER_TABLES_SOURCE_COLUMNS_READY = True
+    except Exception as e:
+        logger.warning(f"_ensure_silver_tables_columns failed: {e}")
+
+
 def _normalize_status(value: Optional[str]) -> str:
     """Map any value to a known status, defaulting to 'not_started'."""
     if not value:
@@ -1345,6 +1734,11 @@ async def list_source_systems(
     """
     silver = get_silver_schema()
     gold = get_gold_schema()
+
+    # Defensive: ensure source_system / source_system_canonical columns exist
+    # on silver_tables (added by normalize_source_systems job; missing on a
+    # fresh deploy before the job runs). See B-017.
+    _ensure_silver_tables_columns()
 
     # Per-canonical rollup driven by silver_tables so we only show what
     # actually landed. LEFT JOIN to canonical so we can include zero-table
@@ -1476,6 +1870,10 @@ async def source_system_detail(name: str) -> dict:
     """
     silver = get_silver_schema()
     gold = get_gold_schema()
+
+    # Defensive: see B-017 / `_ensure_silver_tables_columns`.
+    _ensure_silver_tables_columns()
+
     is_unclassified = name == UNCLASSIFIED_BUCKET
     name_esc = _sql_escape(name)
 
@@ -4672,22 +5070,90 @@ def _emit_progress(run_id: str, step: str, step_index: int, total_steps: int,
         logger.warning(f"Failed to emit progress for step {step}: {e}")
 
 
-def _run_company_research(run_id: str, company: str):
+def _run_company_research(
+    run_id: str,
+    company: str,
+    steps: Optional[list[str]] = None,
+    force: bool = False,
+):
     """Run company research using ai_query() SQL for serverless batch inference.
 
     Emits granular progress to job_progress table so the UI can render
     a live tree: Company -> Departments -> Use Cases per department.
+
+    Args:
+        steps: subset of `ALL_RESEARCH_STEPS` to run. If None, all steps run.
+        force: if true, re-generate even when output rows already exist.
+            Otherwise each step early-exits when its output table already
+            has rows for this company.
+
+    Closes B-006: previously the function ran every step unconditionally,
+    which made the "Resume Research (N steps left)" button misleading and
+    expensive (re-burned LLM tokens + 5+ minutes of work per click).
     """
     catalog = get_catalog()
     silver = get_silver_schema()
     esc_company = _sql_escape(company)
+    steps_set = set(steps) if steps else set(ALL_RESEARCH_STEPS)
 
     def _log(msg: str):
         print(f"[{run_id}] {msg}", flush=True)
         logger.info(f"[{run_id}] {msg}")
 
+    def _company_count(table: str) -> int:
+        """Count rows in a research table for THIS company. Returns 0 on error."""
+        try:
+            rows = execute_query(
+                f"SELECT count(*) AS n FROM {fqn(silver, table)} "
+                f"WHERE company_name = '{esc_company}'"
+            )
+            return int(rows[0]["n"]) if rows else 0
+        except Exception as e:
+            logger.warning(f"_company_count({table}) failed: {e}")
+            return 0
+
+    def _should_run(step: str, table: str) -> bool:
+        """True iff `step` is requested and (force or its output is empty)."""
+        if step not in steps_set:
+            _log(f"Skipping `{step}` (not in requested step list)")
+            return False
+        if not force and _company_count(table) > 0:
+            _log(f"Skipping `{step}` (already has data; pass force=true to re-run)")
+            return False
+        return True
+
     try:
         _active_runs[run_id]["status"] = "RUNNING"
+
+        # ------------------------------------------------------------------
+        # Short-circuit when the user clicks "Resume Research" but every
+        # requested step is already populated and `force` is not set.
+        #
+        # This is the half of B-006 that prevents the embarrassing 5-minute
+        # no-op re-run when the user clicks Resume one extra time. The other
+        # half (per-step skip when only some steps are missing) is tracked as
+        # a follow-up in the backlog under B-006 — fully implementing it
+        # requires extracting each step body into a guarded block, and the
+        # current monolithic structure makes that risky to do in the same
+        # pass as the other circular-dep fixes.
+        # ------------------------------------------------------------------
+        step_to_table = {
+            "profile":     "company_profile",
+            "departments": "departments",
+            "usecases":    "use_cases",
+            "sankey":      "sankey_mappings",
+            "entities":    "use_case_entities",
+        }
+        requested = [s for s in ALL_RESEARCH_STEPS if s in steps_set]
+        all_present = all(
+            _company_count(step_to_table[s]) > 0 for s in requested
+        ) if requested else False
+        if not force and all_present:
+            _log("All requested steps already complete; skipping run "
+                 "(pass force=true to re-generate).")
+            _active_runs[run_id]["status"] = "TERMINATED"
+            _active_runs[run_id]["end_time"] = datetime.utcnow().isoformat()
+            return
 
         execute_query(
             f"DELETE FROM {fqn(silver, 'job_progress')} WHERE run_id = '{_sql_escape(run_id)}'"
@@ -4814,9 +5280,10 @@ def _run_company_research(run_id: str, company: str):
         dept_names = [r["department_name"] for r in dept_rows]
         _log(f"Saved {len(dept_names)} departments.")
 
-        # Now we know total steps: 1 profile + 1 departments + N dept use-cases + 1 sankey = N+3
+        # Now we know total steps: 1 profile + 1 departments + N dept use-cases
+        # + 1 sankey + 1 entities = N+4
         n_depts = len(dept_names)
-        total_steps = n_depts + 3
+        total_steps = n_depts + 4
 
         # Update profile progress row with correct total
         try:
@@ -4961,8 +5428,78 @@ def _run_company_research(run_id: str, company: str):
         cnt = mapping_count[0]["cnt"] if mapping_count else 0
         _log(f"Saved {cnt} Sankey mappings.")
 
-        _emit_progress(run_id, "sankey", total_steps, total_steps, "", company,
+        # Step index for sankey is total_steps - 1; entities is the final step.
+        _emit_progress(run_id, "sankey", total_steps - 1, total_steps, "", company,
                        f"{cnt} mappings")
+
+        # ---- Step 5: Use-case Entities derived from Sankey ----
+        # Closes B-007: the `entities` step was declared in
+        # ALL_RESEARCH_STEPS but never implemented, so the wizard reported
+        # "Resume Research (1 step left)" forever.
+        #
+        # Sankey mappings already contain (use_case, entity_name, source_system)
+        # tuples. Flatten them into use_case_entities, joining to silver.use_cases
+        # to resolve use_case_id. is_matched=true when the entity has a
+        # non-UNMAPPED, non-empty source_system in any of its sankey arcs.
+        _log("Step 5: Deriving use-case entities from sankey mappings...")
+        execute_query(f"DELETE FROM {fqn(silver, 'use_case_entities')} WHERE 1=1")
+
+        # Aggregate sankey -> distinct (use_case, entity) with best source.
+        # `MAX(...) FILTER` would be cleaner but the DBSQL we target across
+        # this codebase doesn't support FILTER on MAX, so we fall back to a
+        # CASE expression inside the aggregate.
+        try:
+            execute_query(f"""
+                INSERT INTO {fqn(silver, 'use_case_entities')}
+                (entity_id, use_case_id, use_case_name, entity_name, entity_type,
+                 description, is_matched, matched_source, company_name, created_at)
+                SELECT
+                  uuid() AS entity_id,
+                  uc.id AS use_case_id,
+                  sm.use_case AS use_case_name,
+                  sm.entity_name,
+                  '' AS entity_type,
+                  '' AS description,
+                  CASE WHEN MAX(CASE
+                       WHEN sm.source_system IS NOT NULL
+                        AND sm.source_system != ''
+                        AND UPPER(sm.source_system) != 'UNMAPPED'
+                       THEN 1 ELSE 0 END) = 1
+                       THEN true ELSE false
+                  END AS is_matched,
+                  COALESCE(MAX(CASE
+                       WHEN sm.source_system IS NOT NULL
+                        AND sm.source_system != ''
+                        AND UPPER(sm.source_system) != 'UNMAPPED'
+                       THEN sm.source_system END), '') AS matched_source,
+                  '{esc_company}' AS company_name,
+                  CAST(current_timestamp() AS STRING) AS created_at
+                FROM {fqn(silver, 'sankey_mappings')} sm
+                LEFT JOIN {fqn(silver, 'use_cases')} uc
+                  ON uc.use_case_name = sm.use_case
+                 AND uc.company_name = '{esc_company}'
+                WHERE sm.company_name = '{esc_company}'
+                  AND sm.entity_name IS NOT NULL
+                  AND sm.entity_name != ''
+                GROUP BY uc.id, sm.use_case, sm.entity_name
+            """)
+        except Exception as e:
+            _log(f"Entity derivation FAILED (non-fatal): {e}")
+
+        ent_count_rows = execute_query(
+            f"SELECT count(*) AS cnt FROM {fqn(silver, 'use_case_entities')} "
+            f"WHERE company_name = '{esc_company}'"
+        )
+        ent_count = ent_count_rows[0]["cnt"] if ent_count_rows else 0
+        matched_rows = execute_query(
+            f"SELECT count(*) AS cnt FROM {fqn(silver, 'use_case_entities')} "
+            f"WHERE company_name = '{esc_company}' AND is_matched = true"
+        )
+        matched_count = matched_rows[0]["cnt"] if matched_rows else 0
+        _log(f"Saved {ent_count} entities ({matched_count} matched to a source).")
+
+        _emit_progress(run_id, "entities", total_steps, total_steps, "", company,
+                       f"{ent_count} entities ({matched_count} matched)")
 
         _active_runs[run_id]["status"] = "TERMINATED"
         _active_runs[run_id]["end_time"] = datetime.utcnow().isoformat()
@@ -5611,8 +6148,14 @@ async def trigger_company_research(body: CompanyResearchIn) -> JobTriggerOut:
             "error": None,
             "job_type": "company-research",
         }
+        # Pass the resolved steps + force flag so the inline runner honors
+        # them. Previously these were dropped on the floor for the inline
+        # path, which made `Resume Research` always re-run every step.
+        # See onboarding-bug-backlog B-006.
         thread = threading.Thread(
-            target=_run_company_research, args=(run_id, body.company_name), daemon=True
+            target=_run_company_research,
+            args=(run_id, body.company_name, list(steps), force_flag),
+            daemon=True,
         )
         thread.start()
         return JobTriggerOut(run_id=run_id, job_id="inline", status="QUEUED")
@@ -5855,109 +6398,201 @@ async def list_uploaded_files():
         return {"files": []}
 
 
+# ---------------------------------------------------------------------------
+# Re-ingest is MERGE-preserving (was DROP+CTAS).
+#
+# Why this matters:
+#   - User-edited rows (is_user_edited=true) survive a re-ingest.
+#   - LLM-enriched columns (ai_definition, business_friendly_name) survive.
+#   - silver_tables.source_system / source_system_canonical (added by the
+#     normalize_source_systems job) are pre-declared in `_SETUP_SILVER_DDL`,
+#     so they survive too — a fresh CSV upload no longer drops them.
+#   - Schemas/tables that disappeared from the new CSV are removed via
+#     WHEN NOT MATCHED BY SOURCE, but only when the row isn't user-edited.
+#
+# See onboarding-bug-backlog "Circular dep B".
+# ---------------------------------------------------------------------------
+
+
+def _ensure_silver_table_exists(table: str) -> None:
+    """Idempotently create a silver table from `_SETUP_SILVER_DDL` if missing.
+
+    Defensive: bootstrap is supposed to run before ingest, but users sometimes
+    hit ingest endpoints out of order. Cheap to re-CREATE (IF NOT EXISTS).
+    """
+    if table not in _SETUP_SILVER_DDL:
+        return
+    catalog = get_catalog()
+    silver = get_silver_schema()
+    ddl = _SETUP_SILVER_DDL[table].format(fqn=f"{catalog}.{silver}.{table}")
+    try:
+        execute_update(
+            ddl,
+            tag_overrides={"submodule": f"ingest_ensure_{table}"},
+        )
+    except Exception as e:
+        logger.warning(f"_ensure_silver_table_exists({table}) failed: {e}")
+
+
 @router.post("/ingest/schemas", operation_id="ingestSchemas")
 async def ingest_schemas(filename: str = Query("all_schemas_dbrk.csv")):
-    """Read a schemas CSV from the Volume and load into silver_schemas using read_files."""
+    """Read a schemas CSV from the Volume and MERGE into silver_schemas.
+
+    Preserves user-edited rows and the rule-derived columns the catalog
+    browser expects. Removes schemas that no longer appear in the CSV
+    (unless they're user-edited).
+    """
     catalog = get_catalog()
     silver = get_silver_schema()
     raw = get_raw_schema()
     vol_path = f"/Volumes/{catalog}/{raw}/uploads/{filename}"
+    target = fqn(silver, "silver_schemas")
+
+    _ensure_silver_table_exists("silver_schemas")
 
     try:
-        execute_query(f"DROP TABLE IF EXISTS {fqn(silver, 'silver_schemas')}")
         execute_query(f"""
-            CREATE TABLE {fqn(silver, 'silver_schemas')} AS
-            SELECT
-              catalog_name, schema_name,
-              COALESCE(schema_owner, '') AS schema_owner,
-              COALESCE(comment, '') AS comment,
-              COALESCE(created, '') AS created,
-              COALESCE(last_altered, '') AS last_altered,
-              COALESCE(workspace_url, '') AS workspace_url,
-              CASE
-                WHEN lower(catalog_name) LIKE '__databricks%' OR lower(catalog_name) IN ('system','samples') THEN 'SYSTEM'
-                WHEN lower(catalog_name) RLIKE '_dev[0-9]{{2}}_' THEN 'DEV'
-                WHEN lower(catalog_name) RLIKE '_qa[0-9]{{2}}_' THEN 'QA'
-                WHEN lower(catalog_name) RLIKE '_prod[0-9]{{2}}_' THEN 'PROD'
-                WHEN lower(catalog_name) LIKE '%_sbx_%' THEN 'SANDBOX'
-                WHEN lower(catalog_name) LIKE '%oracle%' OR lower(catalog_name) LIKE '%sqlserver%' THEN 'EXTERNAL'
-                ELSE 'UNKNOWN'
-              END AS environment,
-              CASE
-                WHEN lower(catalog_name) LIKE '%tmp_landing%' THEN 'LANDING'
-                WHEN lower(catalog_name) LIKE '%standardized%' THEN 'STANDARDIZED'
-                WHEN lower(catalog_name) LIKE '%published%' THEN 'PUBLISHED'
-                WHEN lower(catalog_name) LIKE '%discovery%' THEN 'DISCOVERY'
-                WHEN lower(catalog_name) LIKE '%archived%' THEN 'ARCHIVED'
-                WHEN lower(catalog_name) LIKE '%analytics%' THEN 'ANALYTICS'
-                WHEN lower(catalog_name) LIKE '%oracle%' OR lower(catalog_name) LIKE '%sqlserver%' THEN 'FEDERATED'
-                ELSE 'OTHER'
-              END AS zone,
-              CASE
-                WHEN lower(catalog_name) LIKE 'apm_%' THEN 'Asset Performance Management'
-                WHEN lower(catalog_name) LIKE 'bhermred_%' THEN 'BHE Renewable Energy'
-                WHEN lower(catalog_name) LIKE 'fdm_%' THEN 'Financial Data Management'
-                WHEN lower(catalog_name) LIKE 'gtsdl_%' THEN 'GTS Data Lake'
-                WHEN lower(catalog_name) LIKE 'nvedl_%' THEN 'NV Energy Data Lake'
-                WHEN lower(catalog_name) LIKE 'pac_%' THEN 'PacifiCorp'
-                WHEN lower(catalog_name) LIKE 'trp_%' THEN 'Transmission & Reliability Planning'
-                WHEN lower(catalog_name) LIKE 'whub_%' THEN 'Western Hub'
-                ELSE 'Unknown'
-              END AS program,
-              CASE
-                WHEN lower(catalog_name) LIKE '__databricks%' THEN 'INTERNAL'
-                WHEN lower(schema_name) = 'information_schema' THEN 'SYSTEM'
-                WHEN lower(schema_name) = 'default' THEN 'DEFAULT'
-                WHEN lower(schema_name) LIKE '%test%' OR lower(schema_name) LIKE '%poc%' THEN 'TEST'
-                WHEN lower(schema_name) LIKE 'wflw_%' THEN 'MIGRATION'
-                ELSE 'PRODUCTION'
-              END AS classification,
-              '' AS ai_definition,
-              '' AS business_friendly_name,
-              '' AS suggested_department,
-              '' AS suggested_domain,
-              '' AS data_sensitivity,
-              false AS is_user_edited,
-              '' AS user_edited_at
-            FROM read_files('{vol_path}', format => 'csv', header => true, multiLine => true, escape => '"')
+            MERGE INTO {target} AS t
+            USING (
+              SELECT
+                catalog_name,
+                schema_name,
+                COALESCE(schema_owner, '') AS schema_owner,
+                COALESCE(comment, '') AS comment,
+                COALESCE(created, '') AS created,
+                COALESCE(last_altered, '') AS last_altered,
+                COALESCE(workspace_url, '') AS workspace_url,
+                CASE
+                  WHEN lower(catalog_name) LIKE '__databricks%' OR lower(catalog_name) IN ('system','samples') THEN 'SYSTEM'
+                  WHEN lower(catalog_name) RLIKE '_dev[0-9]{{2}}_' THEN 'DEV'
+                  WHEN lower(catalog_name) RLIKE '_qa[0-9]{{2}}_' THEN 'QA'
+                  WHEN lower(catalog_name) RLIKE '_prod[0-9]{{2}}_' THEN 'PROD'
+                  WHEN lower(catalog_name) LIKE '%_sbx_%' THEN 'SANDBOX'
+                  WHEN lower(catalog_name) LIKE '%oracle%' OR lower(catalog_name) LIKE '%sqlserver%' THEN 'EXTERNAL'
+                  ELSE 'UNKNOWN'
+                END AS environment,
+                CASE
+                  WHEN lower(catalog_name) LIKE '%tmp_landing%' THEN 'LANDING'
+                  WHEN lower(catalog_name) LIKE '%standardized%' THEN 'STANDARDIZED'
+                  WHEN lower(catalog_name) LIKE '%published%' THEN 'PUBLISHED'
+                  WHEN lower(catalog_name) LIKE '%discovery%' THEN 'DISCOVERY'
+                  WHEN lower(catalog_name) LIKE '%archived%' THEN 'ARCHIVED'
+                  WHEN lower(catalog_name) LIKE '%analytics%' THEN 'ANALYTICS'
+                  WHEN lower(catalog_name) LIKE '%oracle%' OR lower(catalog_name) LIKE '%sqlserver%' THEN 'FEDERATED'
+                  ELSE 'OTHER'
+                END AS zone,
+                CASE
+                  WHEN lower(catalog_name) LIKE 'apm_%' THEN 'Asset Performance Management'
+                  WHEN lower(catalog_name) LIKE 'bhermred_%' THEN 'BHE Renewable Energy'
+                  WHEN lower(catalog_name) LIKE 'fdm_%' THEN 'Financial Data Management'
+                  WHEN lower(catalog_name) LIKE 'gtsdl_%' THEN 'GTS Data Lake'
+                  WHEN lower(catalog_name) LIKE 'nvedl_%' THEN 'NV Energy Data Lake'
+                  WHEN lower(catalog_name) LIKE 'pac_%' THEN 'PacifiCorp'
+                  WHEN lower(catalog_name) LIKE 'trp_%' THEN 'Transmission & Reliability Planning'
+                  WHEN lower(catalog_name) LIKE 'whub_%' THEN 'Western Hub'
+                  ELSE 'Unknown'
+                END AS program,
+                CASE
+                  WHEN lower(catalog_name) LIKE '__databricks%' THEN 'INTERNAL'
+                  WHEN lower(schema_name) = 'information_schema' THEN 'SYSTEM'
+                  WHEN lower(schema_name) = 'default' THEN 'DEFAULT'
+                  WHEN lower(schema_name) LIKE '%test%' OR lower(schema_name) LIKE '%poc%' THEN 'TEST'
+                  WHEN lower(schema_name) LIKE 'wflw_%' THEN 'MIGRATION'
+                  ELSE 'PRODUCTION'
+                END AS classification
+              FROM read_files('{vol_path}', format => 'csv', header => true, multiLine => true, escape => '"')
+            ) AS s
+            ON  t.catalog_name = s.catalog_name
+            AND t.schema_name  = s.schema_name
+            WHEN MATCHED AND COALESCE(t.is_user_edited, false) = false THEN UPDATE SET
+              t.schema_owner   = s.schema_owner,
+              t.comment        = s.comment,
+              t.created        = s.created,
+              t.last_altered   = s.last_altered,
+              t.workspace_url  = s.workspace_url,
+              t.environment    = s.environment,
+              t.zone           = s.zone,
+              t.program        = s.program,
+              t.classification = s.classification
+            WHEN NOT MATCHED THEN INSERT (
+              catalog_name, schema_name, schema_owner, comment, created, last_altered,
+              workspace_url, environment, zone, program, classification,
+              ai_definition, business_friendly_name, suggested_department, suggested_domain,
+              data_sensitivity, is_user_edited, user_edited_at
+            ) VALUES (
+              s.catalog_name, s.schema_name, s.schema_owner, s.comment, s.created, s.last_altered,
+              s.workspace_url, s.environment, s.zone, s.program, s.classification,
+              '', '', '', '',
+              '', false, ''
+            )
+            WHEN NOT MATCHED BY SOURCE AND COALESCE(t.is_user_edited, false) = false THEN DELETE
         """)
-        count = execute_query(f"SELECT count(*) as cnt FROM {fqn(silver, 'silver_schemas')}")
+        count = execute_query(f"SELECT count(*) as cnt FROM {target}")
         total = count[0]["cnt"] if count else 0
-        return {"status": "ingested", "table": "silver_schemas", "rows": total}
+        return {"status": "merged", "table": "silver_schemas", "rows": total}
     except Exception as e:
         raise HTTPException(500, f"Ingest failed: {e}")
 
 
 @router.post("/ingest/tables", operation_id="ingestTables")
 async def ingest_tables(filename: str = Query("all_tables_dbrk.csv")):
-    """Read a tables CSV from the Volume and load into silver_tables using read_files."""
+    """Read a tables CSV from the Volume and MERGE into silver_tables.
+
+    Preserves user-edited rows, AI-enriched columns, and the source_system /
+    source_system_canonical columns populated by the normalize job.
+    """
     catalog = get_catalog()
     silver = get_silver_schema()
     raw = get_raw_schema()
     vol_path = f"/Volumes/{catalog}/{raw}/uploads/{filename}"
+    target = fqn(silver, "silver_tables")
+
+    _ensure_silver_table_exists("silver_tables")
 
     try:
-        execute_query(f"DROP TABLE IF EXISTS {fqn(silver, 'silver_tables')}")
         execute_query(f"""
-            CREATE TABLE {fqn(silver, 'silver_tables')} AS
-            SELECT
+            MERGE INTO {target} AS t
+            USING (
+              SELECT
+                table_catalog,
+                table_schema,
+                table_name,
+                COALESCE(table_type, '') AS table_type,
+                COALESCE(table_owner, '') AS table_owner,
+                COALESCE(comment, '') AS comment,
+                COALESCE(created, '') AS created,
+                COALESCE(last_altered, '') AS last_altered,
+                COALESCE(data_source_format, '') AS data_source_format
+              FROM read_files('{vol_path}', format => 'csv', header => true, multiLine => true, escape => '"')
+            ) AS s
+            ON  t.table_catalog = s.table_catalog
+            AND t.table_schema  = s.table_schema
+            AND t.table_name    = s.table_name
+            WHEN MATCHED AND COALESCE(t.is_user_edited, false) = false THEN UPDATE SET
+              t.table_type         = s.table_type,
+              t.table_owner        = s.table_owner,
+              t.comment            = s.comment,
+              t.created            = s.created,
+              t.last_altered       = s.last_altered,
+              t.data_source_format = s.data_source_format
+            WHEN NOT MATCHED THEN INSERT (
               table_catalog, table_schema, table_name,
-              COALESCE(table_type, '') AS table_type,
-              COALESCE(table_owner, '') AS table_owner,
-              COALESCE(comment, '') AS comment,
-              COALESCE(created, '') AS created,
-              COALESCE(last_altered, '') AS last_altered,
-              COALESCE(data_source_format, '') AS data_source_format,
-              'PRODUCTION' AS classification,
-              '' AS ai_definition,
-              '' AS business_friendly_name,
-              false AS is_user_edited,
-              '' AS user_edited_at
-            FROM read_files('{vol_path}', format => 'csv', header => true, multiLine => true, escape => '"')
+              table_type, table_owner, comment, created, last_altered, data_source_format,
+              classification, ai_definition, business_friendly_name,
+              is_user_edited, user_edited_at,
+              source_system, source_system_canonical
+            ) VALUES (
+              s.table_catalog, s.table_schema, s.table_name,
+              s.table_type, s.table_owner, s.comment, s.created, s.last_altered, s.data_source_format,
+              'PRODUCTION', '', '',
+              false, '',
+              CAST(NULL AS STRING), CAST(NULL AS STRING)
+            )
+            WHEN NOT MATCHED BY SOURCE AND COALESCE(t.is_user_edited, false) = false THEN DELETE
         """)
-        count = execute_query(f"SELECT count(*) as cnt FROM {fqn(silver, 'silver_tables')}")
+        count = execute_query(f"SELECT count(*) as cnt FROM {target}")
         total = count[0]["cnt"] if count else 0
-        return {"status": "ingested", "table": "silver_tables", "rows": total}
+        return {"status": "merged", "table": "silver_tables", "rows": total}
     except Exception as e:
         raise HTTPException(500, f"Ingest tables failed: {e}")
 
@@ -5968,18 +6603,61 @@ async def ingest_tables(filename: str = Query("all_tables_dbrk.csv")):
 
 
 def _load_rules(gold: str) -> dict:
-    """Load classification rules from the rules table, grouped by category."""
-    rows = execute_query(
-        f"SELECT category, pattern, label, metadata FROM {fqn(gold, 'classification_rules')} WHERE is_active = true ORDER BY display_order"
-    )
+    """Load classification rules from the rules table, grouped by category.
+
+    Returns an empty dict (not a 500) when the table is missing or empty so
+    callers downstream get a usable shape. Missing rules => no catalogs/schemas
+    are filtered, no programs/zones/environments are derived from rules — but
+    `populate_gold` still runs and produces a sensible (un-classified) baseline.
+    """
+    try:
+        rows = execute_query(
+            f"SELECT category, pattern, label, metadata FROM {fqn(gold, 'classification_rules')} WHERE is_active = true ORDER BY display_order"
+        )
+    except Exception as e:
+        logger.warning(f"_load_rules: classification_rules unavailable ({e}); proceeding with empty ruleset")
+        return {}
     rules: dict = {}
-    for r in rows:
+    for r in rows or []:
         cat = r["category"]
         rules.setdefault(cat, []).append({
             "pattern": r["pattern"], "label": r["label"],
             "metadata": json.loads(r["metadata"]) if r.get("metadata") and r["metadata"] != '{}' else {},
         })
     return rules
+
+
+def _seed_classification_rules_if_empty(gold: str) -> int:
+    """Seed universal ignore patterns into `classification_rules` if empty.
+
+    Idempotent: only inserts when the table has zero rows. Returns the number
+    of rows inserted. Does not raise — failures are logged and swallowed so a
+    transient seed failure doesn't break the wider bootstrap flow.
+    """
+    try:
+        cnt = execute_query(
+            f"SELECT count(*) AS n FROM {fqn(gold, 'classification_rules')}",
+            tag_overrides={"submodule": "setup_seed_rules_probe"},
+        )
+        existing = int(cnt[0]["n"]) if cnt else 0
+        if existing > 0:
+            return 0
+        values_sql = ",\n".join(
+            f"('{r['rule_id']}', '{r['category']}', '{r['pattern']}', "
+            f"'{r['label']}', '{r['description']}', '{{}}', true, {r['display_order']}, "
+            f"current_timestamp(), current_timestamp())"
+            for r in _CLASSIFICATION_RULES_SEED
+        )
+        execute_update(
+            f"INSERT INTO {fqn(gold, 'classification_rules')} "
+            f"(rule_id, category, pattern, label, description, metadata, is_active, display_order, created_at, updated_at) "
+            f"VALUES {values_sql}",
+            tag_overrides={"submodule": "setup_seed_rules_insert"},
+        )
+        return len(_CLASSIFICATION_RULES_SEED)
+    except Exception as e:
+        logger.warning(f"_seed_classification_rules_if_empty failed: {e}")
+        return 0
 
 
 def _glob_match(pattern: str, value: str) -> bool:
@@ -6134,6 +6812,9 @@ def _run_populate_gold(run_id: str):
             def esc(v):
                 return str(v or "").replace("'", "''")
 
+            # NOTE: enriched_at uses an explicit CAST so the all-NULL column
+            # in the VALUES clause doesn't get inferred as VOID and break the
+            # MERGE binding to the TIMESTAMP target column.
             rows_to_insert.append(
                 f"('{esc(sk)}', '{esc(ws_id)}', '{esc(ws_url)}', '{esc(parsed['workspace_name'])}', "
                 f"'{esc(s['catalog_name'])}', '{esc(s['schema_name'])}', '{esc(s.get('schema_owner',''))}', "
@@ -6141,33 +6822,114 @@ def _run_populate_gold(run_id: str):
                 f"'{esc(parsed['zone'])}', '{esc(parsed['classification'])}', "
                 f"{s.get('table_count', 0)}, {s.get('view_count', 0)}, "
                 f"'', '', '', '', '', '', '', "
-                f"'{esc(s.get('created',''))}', '{esc(s.get('last_altered',''))}', NULL, "
+                f"'{esc(s.get('created',''))}', '{esc(s.get('last_altered',''))}', "
+                f"CAST(NULL AS TIMESTAMP), "
                 f"false, '{esc(s.get('comment',''))}')"
             )
         _log(f"Parsed schemas: {len(rows_to_insert)} to insert, {skipped} skipped by ignore rules")
 
-        execute_query(f"DELETE FROM {fqn(gold, 'schema_inventory')} WHERE 1=1")
-
+        # ------------------------------------------------------------------
+        # MERGE-preserving upsert into schema_inventory.
+        #
+        # We deliberately do NOT touch:
+        #   - LLM-enriched columns (definition, business_name, source_system,
+        #     data_domain, department_owner, sensitivity, data_quality_tier,
+        #     enriched_at) — these survive across populate-gold runs so the
+        #     user doesn't lose hours of `ai_query` work on every reclassify.
+        #   - User-edited rows (`is_user_edited = true`) — analyst overrides
+        #     of program/affiliate/zone/classification stick.
+        #
+        # Net behavior for re-runs:
+        #   - New schema discovered     → INSERT with empty enrichment
+        #   - Existing rule-derived row → UPDATE rule cols only, keep enrichment
+        #   - Existing user-edited row  → no-op
+        #   - Schema vanished from src  → DELETE (final pass below)
+        #
+        # Was DELETE + batched INSERT; now MERGE preserves enrichment.
+        # See onboarding-bug-backlog.md "Circular dep A".
+        # ------------------------------------------------------------------
+        seen_keys: list[str] = []
         BATCH = 200
         for i in range(0, len(rows_to_insert), BATCH):
-            batch = ", ".join(rows_to_insert[i:i + BATCH])
+            batch_rows = rows_to_insert[i:i + BATCH]
+            batch_values = ", ".join(batch_rows)
             execute_query(f"""
-                INSERT INTO {fqn(gold, 'schema_inventory')}
-                (schema_key, workspace_id, workspace_url, workspace_name,
-                 catalog_name, schema_name, schema_owner,
-                 program, affiliate, environment, zone, classification,
-                 table_count, view_count,
-                 definition, business_name, source_system, data_domain,
-                 department_owner, sensitivity, data_quality_tier,
-                 created, last_altered, enriched_at,
-                 is_user_edited, comment)
-                VALUES {batch}
+                MERGE INTO {fqn(gold, 'schema_inventory')} AS target
+                USING (
+                    SELECT * FROM (VALUES {batch_values}) AS s(
+                        schema_key, workspace_id, workspace_url, workspace_name,
+                        catalog_name, schema_name, schema_owner,
+                        program, affiliate, environment, zone, classification,
+                        table_count, view_count,
+                        definition, business_name, source_system, data_domain,
+                        department_owner, sensitivity, data_quality_tier,
+                        created, last_altered, enriched_at,
+                        is_user_edited, comment
+                    )
+                ) AS src
+                ON target.schema_key = src.schema_key
+                WHEN MATCHED AND COALESCE(target.is_user_edited, false) = false THEN UPDATE SET
+                    target.workspace_id = src.workspace_id,
+                    target.workspace_url = src.workspace_url,
+                    target.workspace_name = src.workspace_name,
+                    target.catalog_name = src.catalog_name,
+                    target.schema_name = src.schema_name,
+                    target.schema_owner = src.schema_owner,
+                    target.program = src.program,
+                    target.affiliate = src.affiliate,
+                    target.environment = src.environment,
+                    target.zone = src.zone,
+                    target.classification = src.classification,
+                    target.table_count = src.table_count,
+                    target.view_count = src.view_count,
+                    target.created = src.created,
+                    target.last_altered = src.last_altered,
+                    target.comment = src.comment
+                WHEN NOT MATCHED THEN INSERT (
+                    schema_key, workspace_id, workspace_url, workspace_name,
+                    catalog_name, schema_name, schema_owner,
+                    program, affiliate, environment, zone, classification,
+                    table_count, view_count,
+                    definition, business_name, source_system, data_domain,
+                    department_owner, sensitivity, data_quality_tier,
+                    created, last_altered, enriched_at,
+                    is_user_edited, comment
+                ) VALUES (
+                    src.schema_key, src.workspace_id, src.workspace_url, src.workspace_name,
+                    src.catalog_name, src.schema_name, src.schema_owner,
+                    src.program, src.affiliate, src.environment, src.zone, src.classification,
+                    src.table_count, src.view_count,
+                    src.definition, src.business_name, src.source_system, src.data_domain,
+                    src.department_owner, src.sensitivity, src.data_quality_tier,
+                    src.created, src.last_altered, src.enriched_at,
+                    src.is_user_edited, src.comment
+                )
             """)
+            for row in batch_rows:
+                # row starts with "('<schema_key>', '<workspace_id>', ..."
+                # extract schema_key (first quoted value)
+                m = re.match(r"^\(\s*'([^']*)'", row)
+                if m:
+                    seen_keys.append(m.group(1))
             if (i // BATCH) % 10 == 0:
-                _log(f"  Inserted {min(i + BATCH, len(rows_to_insert))}/{len(rows_to_insert)}...")
+                _log(f"  Merged {min(i + BATCH, len(rows_to_insert))}/{len(rows_to_insert)}...")
+
+        # Final pass: remove rows for schemas that no longer appear in silver.
+        # Skip user-edited rows so analysts don't lose work if a schema
+        # temporarily disappears from extraction.
+        if seen_keys:
+            keys_in = ", ".join(f"'{k}'" for k in seen_keys)
+            removed = execute_query(
+                f"DELETE FROM {fqn(gold, 'schema_inventory')} "
+                f"WHERE schema_key NOT IN ({keys_in}) "
+                f"  AND COALESCE(is_user_edited, false) = false"
+            )
+            _log(f"  Removed schemas no longer in silver (preserving user-edited rows)")
+        else:
+            _log("  Skipping orphan-cleanup: no source rows produced this run")
 
         inv_cnt = execute_query(f"SELECT count(*) as cnt FROM {fqn(gold, 'schema_inventory')}")
-        _log(f"schema_inventory populated: {inv_cnt[0]['cnt'] if inv_cnt else 0} rows (skipped {skipped})")
+        _log(f"schema_inventory populated: {inv_cnt[0]['cnt'] if inv_cnt else 0} rows (skipped {skipped} by ignore rules; LLM enrichment preserved across re-runs)")
 
         _log("Step 2/4: Populating source_summary...")
         execute_query(f"DELETE FROM {fqn(gold, 'source_summary')} WHERE 1=1")
@@ -6622,6 +7384,11 @@ async def analytics_schema_tables(
     silver = get_silver_schema()
     inv = fqn(gold, "schema_inventory")
     stables = fqn(silver, "silver_tables")
+
+    # Defensive: source_system / source_system_canonical are ALTER-added by
+    # normalize_source_systems job. Ensure they exist (NULL-valued is fine
+    # for this read path) so we don't 500 on a fresh deploy.
+    _ensure_silver_tables_columns()
 
     esc_schema = schema_name.replace("'", "''")
     search_clause = ""

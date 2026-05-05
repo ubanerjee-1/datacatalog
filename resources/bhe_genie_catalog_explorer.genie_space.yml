@@ -4,39 +4,60 @@
 # `genie_ask` fallback tool.
 #
 # ============================================================================
-# HOW TO DEPLOY THIS RESOURCE
+# RECOMMENDED: deploy from the in-app Setup Wizard, not via this bundle file
 # ============================================================================
 #
-# Genie Space support was added to Databricks Asset Bundles in early 2026
-# (CLI PR databricks/cli#4191). Two requirements apply:
+# The Genie space references tables in <catalog>.bhe_silver and
+# <catalog>.bhe_gold, so it cannot be created until those tables exist.
+# `databricks bundle deploy` runs before the Setup Wizard provisions schemas
+# and tables, which means this resource has nothing valid to point at.
 #
-#   1. Databricks CLI v0.287.0 or later.
-#      Our workspace currently has v0.280.0 — upgrade before first deploy:
+# Instead: open the deployed app, walk the Setup Wizard steps in order, and
+# when you reach "Step 4: Deploy Genie Space" the wizard will:
+#   1. Read the canonical JSON below
+#   2. Substitute your actual catalog (and silver/gold schema names) for the
+#      `your_catalog.*` placeholders
+#   3. Call POST /api/2.0/genie/spaces (or PATCH on re-sync)
+#   4. Persist the returned space_id to <catalog>.bhe_gold.app_config so the
+#      chatbot picks it up at runtime without an app restart
+#
+# That flow is implemented in:
+#   - src/app/src/bhe_catalog/backend/setup_genie.py  (helper)
+#   - src/app/src/bhe_catalog/backend/router.py       (POST /api/setup/deploy-genie-space)
+#   - src/app/src/bhe_catalog/ui/routes/_sidebar/company.tsx  (Step 4 card)
+#
+# ============================================================================
+# OPTIONAL: deploy via this bundle resource
+# ============================================================================
+#
+# Only attempt this if the silver+gold tables already exist in the target
+# workspace AND your CLI is recent enough. Two requirements apply:
+#
+#   1. Databricks CLI v0.287.0 or later (older versions silently skip the
+#      genie_spaces resource without warning):
 #        brew upgrade databricks
-#      (or the equivalent installer for your platform).
 #
-#   2. Bundle direct-deploy engine (NOT the default Terraform engine).
-#      The databricks_genie_space Terraform resource does not yet exist,
-#      so this bundle must be deployed using:
+#   2. Bundle direct-deploy engine (NOT the default Terraform engine):
 #        DATABRICKS_BUNDLE_ENGINE=direct databricks bundle deploy -t <target>
 #
-# If the rest of the BHE bundle is deployed with Terraform, either:
-#   (a) Exclude this single resource from Terraform-mode deploys and run the
-#       Python bootstrap (src/app/create_genie_space.py) on first deploy +
-#       when serialized_space changes, OR
-#   (b) Migrate the full bundle to direct-deploy engine. Recommended once
-#       all other resources are certified on direct mode.
+# If you take this path, you'll still want to write the resulting space_id
+# into bhe_gold.app_config (key='genie_space_id') so the chatbot resolves it
+# at runtime — easiest is to run the Setup Wizard's "Re-sync" button, which
+# is idempotent and writes app_config as a side effect.
 #
 # ============================================================================
 # SOURCE OF TRUTH
 # ============================================================================
 #
-# The actual space content (tables, instructions, example questions) lives in
+# The space content (tables, instructions, example questions) lives in
 # resources/genie_spaces/bhe_catalog_explorer.json. That file is referenced by:
 #   - this DAB resource (via ${file(...)} interpolation)
-#   - src/app/create_genie_space.py (the API bootstrap script)
+#   - src/app/create_genie_space.py (the standalone CLI bootstrap script)
+#   - src/app/src/bhe_catalog/_genie_space_template.json (an in-app copy that
+#     ships with the deployed Databricks App for the in-app deploy path)
 #
-# Editing that JSON is the ONE place to update the space's contents.
+# When editing the JSON, keep the `_genie_space_template.json` copy in sync
+# (scripts/deploy.py asserts equality before pushing).
 #
 # ============================================================================
 

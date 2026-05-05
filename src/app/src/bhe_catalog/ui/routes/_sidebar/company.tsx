@@ -29,8 +29,10 @@ import {
   fetchSetupStatus,
   bootstrapSchemas,
   bootstrapTables,
+  deployGenieSpace,
   nukeSetup,
   type SetupStatus,
+  type GenieDeployResult,
 } from "@/lib/api-client";
 import {
   Card,
@@ -77,6 +79,7 @@ import {
   AlertCircle,
   Skull,
   HardDriveDownload,
+  MessageSquareText,
 } from "lucide-react";
 import { toast } from "sonner";
 
@@ -429,9 +432,16 @@ function CompanyPage() {
         onChanged={() => refetchSetup()}
       />
 
-      {/* Step 4: Company Intelligence (gated until infra is ready) */}
+      {/* Step 4: Deploy Genie Space (optional but recommended) */}
+      <GenieDeployStepCard
+        status={setupStatus}
+        loading={setupLoading}
+        onChanged={() => refetchSetup()}
+      />
+
+      {/* Step 5: Company Intelligence (gated until infra is ready) */}
       <StepCard
-        step={4}
+        step={5}
         title="Company Intelligence"
         description="Enter your company name to auto-generate departments, use cases with business value estimates, and required data entities"
         isComplete={hasProfile && hasData && !isResearching}
@@ -568,9 +578,9 @@ function CompanyPage() {
         )}
       </StepCard>
 
-      {/* Step 5: Data Sources */}
+      {/* Step 6: Data Sources */}
       <StepCard
-        step={5}
+        step={6}
         title="Data Sources"
         description="Load your schema and table metadata — download the extractor utility to pull from multiple workspaces, or upload CSVs directly"
         isComplete={dataReady}
@@ -580,9 +590,9 @@ function CompanyPage() {
         <DataSourceSection />
       </StepCard>
 
-      {/* Step 6: Enrichment Pipeline */}
+      {/* Step 7: Enrichment Pipeline */}
       <StepCard
-        step={6}
+        step={7}
         title="Enrichment Pipeline"
         description="Run the AI enrichment pipeline to classify, describe, and connect your data assets"
         isComplete={false}
@@ -819,6 +829,7 @@ function SetupOverviewBanner({
     { ok: status.llm_access.ok, label: "LLM" },
     { ok: status.schemas.ok, label: "Schemas" },
     { ok: status.tables.ok, label: "Tables" },
+    { ok: status.genie.deployed, label: "Genie" },
     { ok: status.data.ok, label: "Data" },
     { ok: status.company.present, label: "Company" },
   ];
@@ -1307,6 +1318,192 @@ function BootstrapTablesList({
         </p>
       )}
     </div>
+  );
+}
+
+function GenieDeployStepCard({
+  status,
+  loading,
+  onChanged,
+}: {
+  status: SetupStatus | undefined;
+  loading: boolean;
+  onChanged: () => void;
+}) {
+  const [lastResult, setLastResult] = useState<GenieDeployResult | null>(null);
+  const [lastError, setLastError] = useState<string>("");
+
+  const deployMutation = useMutation({
+    mutationFn: ({ forceNew }: { forceNew?: boolean } = {}) =>
+      deployGenieSpace({ forceNew }),
+    onSuccess: (data) => {
+      setLastResult(data);
+      setLastError("");
+      toast.success(
+        data.mode === "created"
+          ? `Genie space created (${data.tables} tables, ${data.example_questions} sample questions)`
+          : `Genie space updated (${data.tables} tables, ${data.example_questions} sample questions)`,
+      );
+      onChanged();
+    },
+    onError: (err) => {
+      const detail =
+        (err as any)?.response?.data?.detail?.message ??
+        (err as any)?.message ??
+        "Genie deploy failed";
+      setLastError(String(detail));
+      toast.error(detail);
+    },
+  });
+
+  // Detect the "PATCH 409 export-format-drift" error -- we surface a
+  // dedicated "create new space" CTA in that case rather than making the
+  // user re-read a 600-character API error.
+  const isPatchConflict = /409.*ABORTED|export format has changed/i.test(
+    lastError,
+  );
+
+  const isDeployable = !!status?.genie?.deployable;
+  const isDeployed = !!status?.genie?.deployed;
+  const spaceId = status?.genie?.space_id ?? "";
+  const spaceUrl = status?.genie?.url ?? "";
+  const source = status?.genie?.source;
+  const dataReady = !!status?.is_data_ready;
+
+  return (
+    <StepCard
+      step={4}
+      title="Deploy Genie Space"
+      description="Provision the 'BHE Catalog Explorer' Genie space the chatbot uses for free-form data questions. Tables are rewritten from the public template's `your_catalog` placeholders to your actual catalog/schema names. Optional — the chatbot's typed `app_*` tools work without it."
+      isComplete={isDeployed}
+      locked={!isDeployable}
+      lockedReason="Click 'Create database tables' in Step 3 first — the Genie space references silver and gold tables that must exist."
+      headerRight={
+        <Badge
+          variant="outline"
+          className="text-[10px] uppercase tracking-wider"
+        >
+          Optional
+        </Badge>
+      }
+    >
+      {!status ? (
+        <p className="text-xs text-muted-foreground">
+          {loading ? "Loading…" : "Setup status unavailable."}
+        </p>
+      ) : (
+        <div className="space-y-3">
+          <div className="flex items-center gap-3 flex-wrap">
+            <Button
+              onClick={() => deployMutation.mutate({})}
+              disabled={!isDeployable || deployMutation.isPending}
+              variant={isDeployed ? "outline" : "default"}
+              size="sm"
+            >
+              {deployMutation.isPending ? (
+                <Loader2 className="h-3.5 w-3.5 mr-1.5 animate-spin" />
+              ) : (
+                <MessageSquareText className="h-3.5 w-3.5 mr-1.5" />
+              )}
+              {isDeployed ? "Re-sync Genie Space" : "Deploy Genie Space"}
+            </Button>
+            {!dataReady && isDeployable && (
+              <p className="text-[11px] text-muted-foreground">
+                Tip: re-sync after ingesting data so example questions reflect
+                what's actually in the catalog.
+              </p>
+            )}
+          </div>
+
+          {isPatchConflict && (
+            <div className="rounded-md border border-amber-500/30 bg-amber-500/5 p-3 text-xs space-y-2">
+              <div className="flex items-start gap-2">
+                <AlertTriangle className="h-4 w-4 text-amber-400 flex-shrink-0 mt-0.5" />
+                <div>
+                  <p className="font-medium text-amber-300">
+                    Existing space can't be updated in place
+                  </p>
+                  <p className="text-muted-foreground mt-0.5">
+                    The Genie API rejected our PATCH because the existing
+                    space ({spaceId || "unknown"}) was authored with a
+                    different export format. You can create a fresh space
+                    instead — the old one will remain but won't be used by
+                    this app anymore.
+                  </p>
+                </div>
+              </div>
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={() => deployMutation.mutate({ forceNew: true })}
+                disabled={deployMutation.isPending}
+              >
+                {deployMutation.isPending ? (
+                  <Loader2 className="h-3.5 w-3.5 mr-1.5 animate-spin" />
+                ) : (
+                  <Sparkles className="h-3.5 w-3.5 mr-1.5" />
+                )}
+                Create a new space instead
+              </Button>
+            </div>
+          )}
+
+          {isDeployed && (
+            <div className="rounded-md border border-emerald-500/30 bg-emerald-500/5 p-3 text-xs space-y-1">
+              <div className="flex items-center gap-2 font-medium text-emerald-300">
+                <CheckCircle2 className="h-3.5 w-3.5" />
+                Genie space is deployed
+              </div>
+              <div className="text-muted-foreground space-y-0.5">
+                <div>
+                  <span className="font-mono">space_id:</span>{" "}
+                  <span className="font-mono">{spaceId}</span>
+                </div>
+                {source && (
+                  <div>
+                    Resolved from:{" "}
+                    <span className="font-mono">
+                      {source === "app_config"
+                        ? "app_config table (runtime)"
+                        : "GENIE_SPACE_ID env var (deploy-time)"}
+                    </span>
+                  </div>
+                )}
+                {spaceUrl && (
+                  <div>
+                    <a
+                      href={spaceUrl}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="inline-flex items-center gap-1 text-emerald-300 hover:underline"
+                    >
+                      <ExternalLink className="h-3 w-3" />
+                      Open in Databricks
+                    </a>
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+
+          {lastResult && deployMutation.isSuccess && (
+            <p className="text-[11px] text-muted-foreground">
+              Last sync: {lastResult.mode} · {lastResult.tables} tables ·{" "}
+              {lastResult.example_questions} example questions
+            </p>
+          )}
+
+          {!isDeployed && isDeployable && (
+            <p className="text-[11px] text-muted-foreground">
+              Without a Genie space, the chatbot still works for typed lookups
+              (entities, schemas, use cases) but the free-form{" "}
+              <span className="font-mono">genie_ask</span> fallback returns "not
+              configured".
+            </p>
+          )}
+        </div>
+      )}
+    </StepCard>
   );
 }
 

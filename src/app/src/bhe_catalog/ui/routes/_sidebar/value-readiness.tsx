@@ -304,128 +304,133 @@ function ValueReadinessPage() {
 
   return (
     <div className="flex flex-col min-h-full">
-      {/* Header + KPI strip */}
-      <div className="border-b bg-background sticky top-0 z-30">
-        <div className="px-6 pt-5 pb-3 flex flex-col gap-3">
-          <div className="flex items-end justify-between gap-4 flex-wrap">
-            <div>
-              <h1 className="text-2xl font-semibold tracking-tight">
-                Value &amp; Readiness
-              </h1>
-              <p className="text-sm text-muted-foreground mt-1 max-w-3xl">
-                What use cases can we deliver today, what&apos;s the dollar
-                impact, and where are the gaps. Slice by affiliate to ground the
-                conversation in a specific operating company.
-              </p>
-            </div>
+      {/* Title + KPI cards scroll naturally — they're context, not action.
+          Pinning them was eating ~400px of every viewport and clipping the
+          treemap below the fold. */}
+      <div className="px-6 pt-5 pb-3 flex flex-col gap-3">
+        <div className="flex items-end justify-between gap-4 flex-wrap">
+          <div>
+            <h1 className="text-2xl font-semibold tracking-tight">
+              Value &amp; Readiness
+            </h1>
+            <p className="text-sm text-muted-foreground mt-1 max-w-3xl">
+              What use cases can we deliver today, what&apos;s the dollar
+              impact, and where are the gaps. Slice by affiliate to ground the
+              conversation in a specific operating company.
+            </p>
           </div>
+        </div>
 
-          {/* Filter bar */}
-          <div className="flex items-center gap-2 flex-wrap">
-            <FilterChip
-              icon={<Building2 size={14} />}
-              label="Affiliate"
-              value={affiliate}
-              options={affiliates.map((a) => ({
-                value: a.affiliate_name,
-                label: `${a.affiliate_name} (${a.use_case_count})`,
-              }))}
-              onChange={setAffiliate}
-              placeholder="All affiliates"
-            />
-            <FilterChip
-              icon={<Users size={14} />}
-              label="Department"
-              value={department}
-              options={departmentOptions}
-              onChange={(d) => {
-                setDepartment(d);
-                // If the currently selected use case isn't in the new dept,
-                // reset it so the typeahead doesn't lie about what's filtered.
-                if (d && search) {
-                  const stillVisible = allUseCases.some(
-                    (u) =>
-                      ((u.department || "").trim() || "Unassigned") === d &&
-                      u.use_case_name === search,
-                  );
-                  if (!stillVisible) setSearch("");
-                }
-              }}
-              placeholder="All departments"
-            />
-            <FilterChip
-              icon={<Filter size={14} />}
-              label="Priority"
-              value={priority}
-              options={PRIORITIES.map((p) => ({ value: p, label: p }))}
-              onChange={setPriority}
-              placeholder="Any priority"
-            />
-            <FilterChip
-              icon={<Activity size={14} />}
-              label="Status"
-              value={status}
-              options={USE_CASE_STATUS_ORDER.map((s) => ({
-                value: s,
-                label: USE_CASE_STATUS_LABEL[s],
-              }))}
-              onChange={setStatus}
-              placeholder="Any status"
-            />
-            <FormulaToggle value={formula} onChange={setFormula} />
-            <Combobox
-              value={search}
-              onChange={setSearch}
-              options={useCaseOptions}
-              placeholder={
-                department
-                  ? `Search ${department} use cases...`
-                  : "Search use cases..."
-              }
-              icon={<Search size={14} />}
-              className="flex-1 min-w-[220px] max-w-md"
-              emptyLabel="No matching use cases"
-            />
-            {activeFilterCount > 0 && (
-              <Button
-                variant="ghost"
-                size="sm"
-                onClick={clearFilters}
-                className="h-8 text-xs"
-              >
-                <X size={12} className="mr-1" />
-                Clear ({activeFilterCount})
-              </Button>
-            )}
-          </div>
+        <KpiStrip summary={summaryData} loading={summaryLoading} />
+        <StatusBreakdownStrip
+          summary={summaryData}
+          loading={summaryLoading}
+          activeStatus={(status as UseCaseStatus) || null}
+          onSelect={(s) => setStatus(status === s ? "" : s)}
+        />
+      </div>
 
-          <KpiStrip summary={summaryData} loading={summaryLoading} />
-          <StatusBreakdownStrip
-            summary={summaryData}
-            loading={summaryLoading}
-            activeStatus={(status as UseCaseStatus) || null}
-            onSelect={(s) => setStatus(status === s ? "" : s)}
+      {/* Sticky action bar: filters + tab nav stay pinned during scroll so
+          users don't have to jump back to the top to switch views or
+          reslice the data. Kept intentionally slim. */}
+      <div className="border-b border-t bg-background sticky top-0 z-30 px-6 py-2 flex flex-col gap-2">
+        {/* Filter bar */}
+        <div className="flex items-center gap-2 flex-wrap">
+          <FilterChip
+            icon={<Building2 size={14} />}
+            label="Affiliate"
+            value={affiliate}
+            options={affiliates.map((a) => ({
+              value: a.affiliate_name,
+              label: `${a.affiliate_name} (${a.use_case_count})`,
+            }))}
+            onChange={setAffiliate}
+            placeholder="All affiliates"
           />
+          <FilterChip
+            icon={<Users size={14} />}
+            label="Department"
+            value={department}
+            options={departmentOptions}
+            onChange={(d) => {
+              setDepartment(d);
+              // If the currently selected use case isn't in the new dept,
+              // reset it so the typeahead doesn't lie about what's filtered.
+              if (d && search) {
+                const stillVisible = allUseCases.some(
+                  (u) =>
+                    ((u.department || "").trim() || "Unassigned") === d &&
+                    u.use_case_name === search,
+                );
+                if (!stillVisible) setSearch("");
+              }
+            }}
+            placeholder="All departments"
+          />
+          <FilterChip
+            icon={<Filter size={14} />}
+            label="Priority"
+            value={priority}
+            options={PRIORITIES.map((p) => ({ value: p, label: p }))}
+            onChange={setPriority}
+            placeholder="Any priority"
+          />
+          <FilterChip
+            icon={<Activity size={14} />}
+            label="Status"
+            value={status}
+            options={USE_CASE_STATUS_ORDER.map((s) => ({
+              value: s,
+              label: USE_CASE_STATUS_LABEL[s],
+            }))}
+            onChange={setStatus}
+            placeholder="Any status"
+          />
+          <FormulaToggle value={formula} onChange={setFormula} />
+          <Combobox
+            value={search}
+            onChange={setSearch}
+            options={useCaseOptions}
+            placeholder={
+              department
+                ? `Search ${department} use cases...`
+                : "Search use cases..."
+            }
+            icon={<Search size={14} />}
+            className="flex-1 min-w-[220px] max-w-md"
+            emptyLabel="No matching use cases"
+          />
+          {activeFilterCount > 0 && (
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={clearFilters}
+              className="h-8 text-xs"
+            >
+              <X size={12} className="mr-1" />
+              Clear ({activeFilterCount})
+            </Button>
+          )}
+        </div>
 
-          {/* Tab nav */}
-          <div className="flex items-center gap-1 -mb-3 mt-1">
-            {TABS.map((t) => (
-              <button
-                key={t.key}
-                type="button"
-                onClick={() => setTab(t.key)}
-                className={
-                  "flex items-center gap-1.5 text-sm px-3 py-2 border-b-2 transition-colors " +
-                  (tab === t.key
-                    ? "border-primary text-foreground"
-                    : "border-transparent text-muted-foreground hover:text-foreground")
-                }
-              >
-                {t.icon}
-                <span>{t.label}</span>
-              </button>
-            ))}
-          </div>
+        {/* Tab nav */}
+        <div className="flex items-center gap-1 -mb-2">
+          {TABS.map((t) => (
+            <button
+              key={t.key}
+              type="button"
+              onClick={() => setTab(t.key)}
+              className={
+                "flex items-center gap-1.5 text-sm px-3 py-2 border-b-2 transition-colors " +
+                (tab === t.key
+                  ? "border-primary text-foreground"
+                  : "border-transparent text-muted-foreground hover:text-foreground")
+              }
+            >
+              {t.icon}
+              <span>{t.label}</span>
+            </button>
+          ))}
         </div>
       </div>
 
