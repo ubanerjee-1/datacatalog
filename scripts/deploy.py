@@ -540,6 +540,14 @@ def main() -> None:
 
     # --- build SPA ---
     if not args.skip_build:
+        # On a fresh clone (or any machine that hasn't run `npm install` in
+        # src/app/), `node_modules/` doesn't exist and `npx vite build` fails
+        # with a generic "command not found" / "system cannot find the path
+        # specified" — particularly opaque on Windows. Bootstrap on demand.
+        node_modules = APP_DIR / "node_modules"
+        if not node_modules.is_dir():
+            info("node_modules not found — running npm install (one-time)")
+            run(["npm", "install"], cwd=APP_DIR)
         info("building the frontend with vite")
         run(["npx", "vite", "build"], cwd=APP_DIR)
     else:
