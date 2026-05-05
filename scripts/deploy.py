@@ -395,6 +395,56 @@ def get_app_service_principal(app_name: str, profile: str, max_wait_s: int = 30)
     return ""  # unreachable
 
 
+def execute_sql(sql: str, warehouse_id: str, profile: str) -> None:
+    """Run a single statement on the configured SQL warehouse.
+
+    Used by deploy-time bootstrap operations that *must* happen before the
+    app is reachable (e.g. CREATE SCHEMA so per-schema GRANTs have something
+    to attach to). Wraps `databricks api post /api/2.0/sql/statements` and
+    fails loudly if the statement state is anything other than SUCCEEDED.
+    """
+    result = run(
+        [
+            "databricks", "api", "post", "/api/2.0/sql/statements",
+            "-p", profile,
+            "--json", json.dumps({
+                "warehouse_id": warehouse_id,
+                "statement": sql,
+                "wait_timeout": "30s",
+            }),
+        ],
+        capture=True,
+    )
+    try:
+        data = json.loads(result.stdout or "{}")
+    except json.JSONDecodeError:
+        die(f"unparseable SQL response for `{sql}`: {result.stdout[:300]}")
+    status = data.get("status") or {}
+    state = status.get("state")
+    if state != "SUCCEEDED":
+        err = (status.get("error") or {}).get("message") or status.get("state")
+        die(f"SQL failed (`{sql}`): {err}")
+
+
+def ensure_schemas_exist(
+    catalog: str, schemas: list[str], warehouse_id: str, profile: str
+) -> None:
+    """`CREATE SCHEMA IF NOT EXISTS` for every schema we'll grant on.
+
+    The in-app Setup Wizard runs the same idempotent DDL on first launch,
+    but it can't run until the app starts and the app can't usefully start
+    without per-schema GRANTs landed first. Doing it from the deploy script
+    breaks the chicken-and-egg without changing the wizard's contract.
+    """
+    for schema in schemas:
+        info(f"ensuring schema exists: {catalog}.{schema}")
+        execute_sql(
+            f"CREATE SCHEMA IF NOT EXISTS `{catalog}`.`{schema}`",
+            warehouse_id=warehouse_id,
+            profile=profile,
+        )
+
+
 def grant_uc(catalog: str, sp_id: str, profile: str, schemas: dict[str, list[str]]) -> None:
     """Idempotent UC grants: catalog-level + per-schema."""
     info("granting catalog-level privileges to the app service principal")
@@ -591,6 +641,14 @@ def main() -> None:
         info(f"resolving service principal for `{ctx.app_name}`")
         sp_id = get_app_service_principal(ctx.app_name, ctx.profile)
         info(f"app service principal: {sp_id}")
+        # Schemas must exist before we can grant on them. The Setup Wizard's
+        # CREATE SCHEMA IF NOT EXISTS will be a no-op on first run.
+        ensure_schemas_exist(
+            catalog=ctx.catalog,
+            schemas=[ctx.raw_schema, ctx.silver_schema, ctx.gold_schema],
+            warehouse_id=ctx.warehouse_id,
+            profile=ctx.profile,
+        )
         grant_uc(
             catalog=ctx.catalog,
             sp_id=sp_id,
