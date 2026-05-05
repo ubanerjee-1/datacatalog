@@ -177,8 +177,15 @@ The data does exist — entity names are populated as a column in `sankey_mappin
 | | |
 |---|---|
 | **Severity** | Medium (users have to manually trigger from Workflows) |
-| **Status** | ⏳ **PENDING** |
-| **Where** | `src/app/src/bhe_catalog/ui/routes/_sidebar/company.tsx` (Step 7 cards) |
+| **Status** | ✅ **FIXED** (2026-05-12, jointly with B-014) |
+| **Where** | `src/app/src/bhe_catalog/backend/router.py` `_trigger_databricks_job` / `_status_databricks_job` + 6 endpoints; `src/app/src/bhe_catalog/ui/routes/_sidebar/company.tsx` Step 7 cards 5-7 |
+
+**Fix recap:**
+- Backend: extracted the `find_job + run_now + record run` boilerplate into `_trigger_databricks_job(name_match)` + `_status_databricks_job(name_match)` helpers. Three pairs of routes added: `POST/GET /jobs/normalize-sources/run+status`, `/jobs/value-model/run+status`, `/jobs/glossary/run+status`. Each pair is a 3-line wrapper around the helper.
+- Backend: `pipeline_status` extended to include `normalize_sources`, `value_model`, `glossary` keys. Replaced its broken `j.settings.name` access (was raising AttributeError silently) with `_status_databricks_job` for consistency.
+- Frontend: 3 new mutations + 3 status queries + 3 useEffect blocks (mirror the existing tableEnrichMutation pattern). 3 new `PipelineJobCard`s added to Step 7 (cards 5/6/7) with descriptive copy and icons (Network / Workflow / BookOpen).
+- Frontend: `runAllPhase` state machine extended from `gold | enrich | tables | taxonomy` → `... | normalize | valuemodel | glossary`. The "Run All (Sequential)" button now chains through all 7 cards in order, automatically enforcing the B-014 dependency.
+- The card copy explicitly calls out that Value Model Build's Stage 4 silently no-ops on empty `use_cases` until the chat-driven UC seeding lands (post-2026-05-12 architectural change).
 
 **Symptom:** After deploy, the wizard exposes 4 enrichment cards but 3 deployed Databricks jobs have no UI button: `BHE Value Model Build`, `BHE Source-System Normalization`, `BHE Glossary Builder`. Users discover them only by going to the Workflows UI directly.
 
@@ -363,8 +370,10 @@ CREATE TABLE IF NOT EXISTS <catalog>.bhe_gold.schema_taxonomy (
 | | |
 |---|---|
 | **Severity** | Medium (job fails with cryptic `TABLE_OR_VIEW_NOT_FOUND` if run out of order) |
-| **Status** | ⏳ **PENDING** |
-| **Where** | `src/jobs/build_value_model.py` Stage 4, `src/jobs/normalize_source_systems.py` |
+| **Status** | ✅ **FIXED** (2026-05-12, jointly with B-008) |
+| **Where** | `src/app/src/bhe_catalog/ui/routes/_sidebar/company.tsx` Run All Sequential phase machine |
+
+**Fix recap:** Wired the orphan jobs into Step 7 in strict dependency order (Source-System Normalization → Value Model Build → Glossary Builder). The "Run All (Sequential)" button now chains through all 7 cards in order, so the user never has to know that Value Model Build depends on Normalization. The hidden dependency is now invisible. Manual single-card runs still respect the order in the sense that running them out of order will produce the same `TABLE_OR_VIEW_NOT_FOUND` as before, but the wizard's natural flow (top-to-bottom, or Run All) avoids it.
 
 **Symptom:** Running `BHE Value Model Build` before `BHE Source-System Normalization` fails with:
 
@@ -560,14 +569,13 @@ Seven phases shipped in a single backend-only pass before the fresh-deploy E2E t
 
 If we're picking one PR at a time post-E2E:
 
-1. **B-008 + B-014 together** (wire 3 orphan jobs into wizard, sequenced in dependency order) — ~2 h, eliminates "now manually trigger 3 jobs in the right order" + makes B-014 invisible.
-2. **Circular dep D** (use_case ID stability across research re-runs) — ~4 h, deterministic IDs + FK cleanup so KB proposal links don't dangle.
-3. **Circular dep E** (silver_schemas vs schema_inventory dual computation of program/zone) — partially mitigated by B-018 (rules now source-of-truth post-populate), but the silver_schemas CTAS still has hardcoded BHE patterns.
-4. **B-003 (rest)** — same LLM-generate-then-MERGE pattern for `program_affiliate_map_seed.csv` and `source_system_canonical_seed.csv` as we did for affiliates in 2026-05-12. ~1.5 h each.
-5. **B-009** (persist run state) — 1 h, nice-to-have until someone hits it in prod.
-6. **B-023** (`bundle destroy` async cleanup) — gather more evidence before fixing.
+1. **Circular dep D** (use_case ID stability across research re-runs) — ~4 h, deterministic IDs + FK cleanup so KB proposal links don't dangle.
+2. **Circular dep E** (silver_schemas vs schema_inventory dual computation of program/zone) — partially mitigated by B-018 (rules now source-of-truth post-populate), but the silver_schemas CTAS still has hardcoded BHE patterns.
+3. **B-003 (rest)** — same LLM-generate-then-MERGE pattern for `program_affiliate_map_seed.csv` and `source_system_canonical_seed.csv` as we did for affiliates in 2026-05-12. ~1.5 h each.
+4. **B-009** (persist run state) — 1 h, nice-to-have until someone hits it in prod.
+5. **B-023** (`bundle destroy` async cleanup) — gather more evidence before fixing.
 
-Total for a single "polish iteration": ~3 hours of engineering.
+Total for a single "polish iteration": ~1.5 hours of engineering.
 
 ---
 
@@ -580,6 +588,7 @@ Followups to the 2026-05-05 E2E hardening, all small:
 | B-003 (affiliates portion) | Affiliates seeded by LLM as Step 3 of company research; `stage_seed_affiliates` retired |
 | B-005 | Superseded — UC generation removed from research; chat-driven and source-grounded going forward |
 | B-006 (rest) | Each step body in `_run_company_research` wrapped in `_should_run`; partial-resume now actually skips completed steps. `dept_names` re-hydrated from DB so progress emits work even when Step 2 is skipped |
+| B-008 + B-014 | 3 orphan jobs (Source-System Normalization, Value Model Build, Glossary Builder) wired into Step 7 cards 5/6/7 + Run All Sequential extended through them. B-014's hidden dependency is now invisible because Run All enforces the order |
 | B-016 | `POST /artifacts` + `ArtifactCreateIn` model + "New" Sheet panel with vocab+filters dropdowns |
 | B-021 | `deploy.py` pre-flight `databricks catalogs get` rejects `MANAGED_ONLINE_CATALOG` early |
 | B-022 | `deploy.py` derives host from `--profile` via `databricks auth describe`, no more redundant `--workspace-url` |

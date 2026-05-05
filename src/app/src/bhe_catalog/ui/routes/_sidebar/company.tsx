@@ -21,6 +21,12 @@ import {
   downloadSchemaExtractor,
   triggerTableEnrichment,
   fetchTableEnrichmentStatus,
+  triggerNormalizeSourcesJob,
+  fetchNormalizeSourcesStatus,
+  triggerValueModelJob,
+  fetchValueModelStatus,
+  triggerGlossaryJob,
+  fetchGlossaryStatus,
   fetchPipelineStatus,
   fetchBranding,
   updateBranding,
@@ -56,6 +62,9 @@ import {
   Database,
   Layers,
   Grid3X3,
+  Network,
+  Workflow,
+  BookOpen,
   Download,
   ArrowRight,
   DollarSign,
@@ -95,6 +104,12 @@ function CompanyPage() {
   const [goldRunId, setGoldRunId] = useState<string | null>(null);
   const [taxRunId, setTaxRunId] = useState<string | null>(null);
   const [tableEnrichRunId, setTableEnrichRunId] = useState<string | null>(null);
+  // B-008/B-014: orphan job run-ids (Source-System Normalization, Value
+  // Model Build, Glossary Builder). Each tracks a Databricks run_id; the
+  // status queries below poll until the run resolves to SUCCESS / FAILED.
+  const [normalizeRunId, setNormalizeRunId] = useState<string | null>(null);
+  const [valueModelRunId, setValueModelRunId] = useState<string | null>(null);
+  const [glossaryRunId, setGlossaryRunId] = useState<string | null>(null);
 
   const { data: profile } = useQuery({
     queryKey: ["companyProfile"],
@@ -205,6 +220,89 @@ function CompanyPage() {
       setTableEnrichRunId(null);
     }
   }, [tableEnrichStatus?.status]);
+
+  // --- B-008/B-014: orphan-job status polling ---
+  // All three jobs use the same shape as tableEnrichStatus (fetched
+  // straight from the Databricks Jobs API, status string is
+  // SUCCESS/FAILED/RUNNING). Polling stops once the job resolves.
+
+  const { data: normalizeStatus } = useQuery({
+    queryKey: ["normalizeSourcesStatus", normalizeRunId],
+    queryFn: fetchNormalizeSourcesStatus,
+    enabled: !!normalizeRunId,
+    refetchInterval: (query) => {
+      const s = query.state.data?.status;
+      if (s === "SUCCESS" || s === "FAILED" || s === "TERMINATED") return false;
+      return 10000;
+    },
+  });
+
+  useEffect(() => {
+    if (!normalizeRunId) return;
+    const s = normalizeStatus?.status;
+    if (s === "SUCCESS" || s === "TERMINATED") {
+      toast.success("Source-system normalization complete!");
+      queryClient.invalidateQueries({ queryKey: ["sourceSystems"] });
+      refetchPipelineStatus();
+      setNormalizeRunId(null);
+    }
+    if (s === "FAILED") {
+      toast.error("Source-system normalization failed");
+      setNormalizeRunId(null);
+    }
+  }, [normalizeStatus?.status]);
+
+  const { data: valueModelStatus } = useQuery({
+    queryKey: ["valueModelStatus", valueModelRunId],
+    queryFn: fetchValueModelStatus,
+    enabled: !!valueModelRunId,
+    refetchInterval: (query) => {
+      const s = query.state.data?.status;
+      if (s === "SUCCESS" || s === "FAILED" || s === "TERMINATED") return false;
+      return 10000;
+    },
+  });
+
+  useEffect(() => {
+    if (!valueModelRunId) return;
+    const s = valueModelStatus?.status;
+    if (s === "SUCCESS" || s === "TERMINATED") {
+      toast.success("Value model build complete!");
+      queryClient.invalidateQueries({ queryKey: ["affiliates"] });
+      queryClient.invalidateQueries({ queryKey: ["useCases"] });
+      refetchPipelineStatus();
+      setValueModelRunId(null);
+    }
+    if (s === "FAILED") {
+      toast.error("Value model build failed");
+      setValueModelRunId(null);
+    }
+  }, [valueModelStatus?.status]);
+
+  const { data: glossaryStatus } = useQuery({
+    queryKey: ["glossaryStatus", glossaryRunId],
+    queryFn: fetchGlossaryStatus,
+    enabled: !!glossaryRunId,
+    refetchInterval: (query) => {
+      const s = query.state.data?.status;
+      if (s === "SUCCESS" || s === "FAILED" || s === "TERMINATED") return false;
+      return 10000;
+    },
+  });
+
+  useEffect(() => {
+    if (!glossaryRunId) return;
+    const s = glossaryStatus?.status;
+    if (s === "SUCCESS" || s === "TERMINATED") {
+      toast.success("Glossary build complete!");
+      refetchPipelineStatus();
+      setGlossaryRunId(null);
+    }
+    if (s === "FAILED") {
+      toast.error("Glossary build failed");
+      setGlossaryRunId(null);
+    }
+  }, [glossaryStatus?.status]);
 
   useEffect(() => {
     if (jobStatus?.status === "TERMINATED") {
@@ -322,14 +420,66 @@ function CompanyPage() {
     onError: () => toast.error("Failed to start table enrichment job"),
   });
 
+  // --- B-008/B-014: orphan-job mutations ---
+
+  const normalizeMutation = useMutation({
+    mutationFn: triggerNormalizeSourcesJob,
+    onSuccess: (data) => {
+      setNormalizeRunId(data.run_id);
+      toast.info("Source-system normalization submitted to Databricks...");
+    },
+    onError: () =>
+      toast.error("Failed to start Source-System Normalization job"),
+  });
+
+  const valueModelMutation = useMutation({
+    mutationFn: triggerValueModelJob,
+    onSuccess: (data) => {
+      setValueModelRunId(data.run_id);
+      toast.info("Value model build submitted to Databricks...");
+    },
+    onError: () => toast.error("Failed to start Value Model Build job"),
+  });
+
+  const glossaryMutation = useMutation({
+    mutationFn: triggerGlossaryJob,
+    onSuccess: (data) => {
+      setGlossaryRunId(data.run_id);
+      toast.info("Glossary build submitted to Databricks...");
+    },
+    onError: () => toast.error("Failed to start Glossary Builder job"),
+  });
+
   const { data: pipelineStatus, refetch: refetchPipelineStatus } = useQuery({
     queryKey: ["pipelineStatus"],
     queryFn: fetchPipelineStatus,
-    refetchInterval: (enrichRunId || goldRunId || taxRunId || tableEnrichRunId) ? 10000 : false,
+    refetchInterval:
+      enrichRunId ||
+      goldRunId ||
+      taxRunId ||
+      tableEnrichRunId ||
+      normalizeRunId ||
+      valueModelRunId ||
+      glossaryRunId
+        ? 10000
+        : false,
   });
 
+  // B-008/B-014: Run All sequential pipeline phases.
+  // gold → enrich → tables → taxonomy → normalize → valuemodel → glossary
+  // The last three are the orphan jobs wired in this commit. Order
+  // matches the dependency chain: Source-System Normalization writes
+  // gold.source_system_canonical, which Value Model Build Stage 4 reads;
+  // Glossary Builder reads canonical sources too, so it runs last.
   const [runAllPhase, setRunAllPhase] = useState<
-    null | "gold" | "enrich" | "tables" | "taxonomy"
+    | null
+    | "gold"
+    | "enrich"
+    | "tables"
+    | "taxonomy"
+    | "normalize"
+    | "valuemodel"
+    | "glossary"
   >(null);
 
   useEffect(() => {
@@ -353,9 +503,39 @@ function CompanyPage() {
       }
     }
     if (runAllPhase === "taxonomy" && taxStatus?.status === "TERMINATED") {
-      setRunAllPhase(null);
-      refetchPipelineStatus();
-      toast.success("All pipeline jobs complete!");
+      setRunAllPhase("normalize");
+      normalizeMutation.mutate();
+    }
+    if (runAllPhase === "normalize") {
+      const s = normalizeStatus?.status;
+      if (s === "SUCCESS" || s === "TERMINATED") {
+        setRunAllPhase("valuemodel");
+        valueModelMutation.mutate();
+      }
+      if (s === "FAILED") {
+        setRunAllPhase(null);
+      }
+    }
+    if (runAllPhase === "valuemodel") {
+      const s = valueModelStatus?.status;
+      if (s === "SUCCESS" || s === "TERMINATED") {
+        setRunAllPhase("glossary");
+        glossaryMutation.mutate();
+      }
+      if (s === "FAILED") {
+        setRunAllPhase(null);
+      }
+    }
+    if (runAllPhase === "glossary") {
+      const s = glossaryStatus?.status;
+      if (s === "SUCCESS" || s === "TERMINATED") {
+        setRunAllPhase(null);
+        refetchPipelineStatus();
+        toast.success("All pipeline jobs complete!");
+      }
+      if (s === "FAILED") {
+        setRunAllPhase(null);
+      }
     }
     if (
       (runAllPhase === "gold" && goldStatus?.status === "FAILED") ||
@@ -364,7 +544,16 @@ function CompanyPage() {
     ) {
       setRunAllPhase(null);
     }
-  }, [runAllPhase, goldStatus?.status, enrichStatus?.status, tableEnrichStatus?.status, taxStatus?.status]);
+  }, [
+    runAllPhase,
+    goldStatus?.status,
+    enrichStatus?.status,
+    tableEnrichStatus?.status,
+    taxStatus?.status,
+    normalizeStatus?.status,
+    valueModelStatus?.status,
+    glossaryStatus?.status,
+  ]);
 
   const handleRunAll = () => {
     setRunAllPhase("gold");
@@ -376,7 +565,17 @@ function CompanyPage() {
   const isPopulatingGold = !!goldRunId;
   const isGeneratingTax = !!taxRunId;
   const isEnrichingTables = !!tableEnrichRunId;
-  const isAnyPipelineRunning = isEnriching || isPopulatingGold || isGeneratingTax || isEnrichingTables;
+  const isNormalizing = !!normalizeRunId;
+  const isBuildingValueModel = !!valueModelRunId;
+  const isBuildingGlossary = !!glossaryRunId;
+  const isAnyPipelineRunning =
+    isEnriching ||
+    isPopulatingGold ||
+    isGeneratingTax ||
+    isEnrichingTables ||
+    isNormalizing ||
+    isBuildingValueModel ||
+    isBuildingGlossary;
 
   const hasProfile = !!profile?.company_name;
   const hasData = !!(departments?.length || useCases?.length);
@@ -620,7 +819,10 @@ function CompanyPage() {
         }
       >
         <p className="text-xs text-muted-foreground -mt-2 mb-3">
-          Jobs run in order: Gold Layer → Enrich Schemas → Enrich Tables → Generate Taxonomy.
+          Jobs run in order: Gold Layer → Enrich Schemas → Enrich Tables →
+          Generate Taxonomy → Source-System Normalization → Value Model Build →
+          Glossary Builder. Order matters — Value Model Build reads canonical
+          sources written by Normalization (B-014).
         </p>
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
           <PipelineJobCard
@@ -681,6 +883,77 @@ function CompanyPage() {
               ? `${pipelineStatus.generate_taxonomy.classified.toLocaleString()} classified`
               : undefined}
             highlight={runAllPhase === "taxonomy"}
+          />
+          <PipelineJobCard
+            step="5"
+            title="Source-System Normalization"
+            description="Cluster free-text source_system values into a canonical vocabulary. Required input for Value Model."
+            icon={<Network className="h-4 w-4" />}
+            isRunning={isNormalizing}
+            status={normalizeStatus?.status}
+            onRun={() => normalizeMutation.mutate()}
+            lastRun={
+              pipelineStatus?.normalize_sources?.last_run
+                ? new Date(
+                    Number(pipelineStatus.normalize_sources.last_run),
+                  ).toISOString()
+                : undefined
+            }
+            subtitle={
+              pipelineStatus?.normalize_sources?.status
+                ? `Job: ${pipelineStatus.normalize_sources.status}`
+                : undefined
+            }
+            highlight={runAllPhase === "normalize"}
+            externalUrl={
+              pipelineStatus?.normalize_sources?.run_page_url || undefined
+            }
+          />
+          <PipelineJobCard
+            step="6"
+            title="Value Model Build"
+            description="Map use cases onto canonical sources + program/affiliate. Stage 4 no-ops until use cases are seeded via chat."
+            icon={<Workflow className="h-4 w-4" />}
+            isRunning={isBuildingValueModel}
+            status={valueModelStatus?.status}
+            onRun={() => valueModelMutation.mutate()}
+            lastRun={
+              pipelineStatus?.value_model?.last_run
+                ? new Date(
+                    Number(pipelineStatus.value_model.last_run),
+                  ).toISOString()
+                : undefined
+            }
+            subtitle={
+              pipelineStatus?.value_model?.status
+                ? `Job: ${pipelineStatus.value_model.status}`
+                : undefined
+            }
+            highlight={runAllPhase === "valuemodel"}
+            externalUrl={pipelineStatus?.value_model?.run_page_url || undefined}
+          />
+          <PipelineJobCard
+            step="7"
+            title="Glossary Builder"
+            description="Generate the system × domain glossary from canonical sources. Optional, runs last."
+            icon={<BookOpen className="h-4 w-4" />}
+            isRunning={isBuildingGlossary}
+            status={glossaryStatus?.status}
+            onRun={() => glossaryMutation.mutate()}
+            lastRun={
+              pipelineStatus?.glossary?.last_run
+                ? new Date(
+                    Number(pipelineStatus.glossary.last_run),
+                  ).toISOString()
+                : undefined
+            }
+            subtitle={
+              pipelineStatus?.glossary?.status
+                ? `Job: ${pipelineStatus.glossary.status}`
+                : undefined
+            }
+            highlight={runAllPhase === "glossary"}
+            externalUrl={pipelineStatus?.glossary?.run_page_url || undefined}
           />
         </div>
       </StepCard>

@@ -5864,32 +5864,25 @@ async def pipeline_status() -> dict:
     except Exception:
         r = {}
 
-    # Table enrichment: check the Databricks job directly
-    table_enrich = {"status": "UNKNOWN", "last_run": None, "run_page_url": None}
-    try:
-        db = DatabricksClient()
-        JOB_NAME = "BHE AI Table Enrichment"
-        jobs_list = list(db.jobs.list(name="Table Enrichment"))
-        matched = [j for j in jobs_list if JOB_NAME in (j.settings.name if j.settings else "")]
-        if not matched:
-            jobs_list = list(db.jobs.list())
-            matched = [j for j in jobs_list if JOB_NAME in (j.settings.name if j.settings else "")]
-        if matched:
-            job_id = matched[0].job_id
-            runs = db.api("GET", "/api/2.1/jobs/runs/list",
-                          params={"job_id": job_id, "limit": 1})
-            run_list = runs.get("runs", [])
-            if run_list:
-                run = run_list[0]
-                state = run.get("state", {})
-                table_enrich = {
-                    "status": state.get("result_state") or state.get("life_cycle_state", "UNKNOWN"),
-                    "last_run": run.get("end_time") or run.get("start_time"),
-                    "run_page_url": run.get("run_page_url", ""),
-                    "job_id": job_id,
-                }
-    except Exception:
-        pass
+    # Databricks-job-backed pipeline cards: query the latest run state
+    # directly. Wrapped in a per-job try/except so one missing/orphaned
+    # bundle doesn't blank out the whole pipeline-status panel.
+    def _job_status_compact(name_match: str) -> dict:
+        try:
+            s = _status_databricks_job(name_match)
+        except Exception:
+            return {"status": "UNKNOWN", "last_run": None, "run_page_url": None}
+        return {
+            "status": s.get("status", "UNKNOWN"),
+            "last_run": s.get("end_time") or s.get("start_time"),
+            "run_page_url": s.get("run_page_url", ""),
+            "job_id": s.get("job_id"),
+        }
+
+    table_enrich = _job_status_compact("BHE AI Table Enrichment")
+    normalize_sources = _job_status_compact("BHE Source-System Normalization")
+    value_model = _job_status_compact("BHE Value Model Build")
+    glossary = _job_status_compact("BHE Glossary Builder")
 
     return {
         "populate_gold": {
@@ -5906,6 +5899,9 @@ async def pipeline_status() -> dict:
             "classified": int(r["taxonomy_done"]) if r.get("taxonomy_done") else 0,
         },
         "enrich_tables": table_enrich,
+        "normalize_sources": normalize_sources,
+        "value_model": value_model,
+        "glossary": glossary,
     }
 
 
@@ -6066,6 +6062,84 @@ def _run_table_enrichment(run_id: str, schema_name: str, batch_size: int = 100):
         _active_runs[run_id]["end_time"] = datetime.utcnow().isoformat()
 
 
+def _find_databricks_job(name_match: str) -> dict | None:
+    """Locate a deployed bundle job by substring match on its name.
+
+    Bundle jobs are deployed with names like `[dev] BHE Source-System
+    Normalization` — the target prefix varies but the rest is stable.
+    Two-pass search: first try the API's `name` filter as a hint, then
+    fall back to listing all jobs (handles the case where the API's
+    name filter is exact-match in some workspace configs).
+    """
+    db = DatabricksClient()
+    jobs = db.jobs.list(name=name_match)
+    matched = [j for j in jobs if name_match in j.get("settings", {}).get("name", "")]
+    if not matched:
+        jobs = db.jobs.list()
+        matched = [j for j in jobs if name_match in j.get("settings", {}).get("name", "")]
+    return matched[0] if matched else None
+
+
+def _trigger_databricks_job(
+    name_match: str,
+    python_params: list[str] | None = None,
+) -> JobTriggerOut:
+    """Common path for the orphan-job trigger endpoints (B-008 + B-014).
+
+    Looks up the deployed bundle job, calls `run_now`, and registers the
+    run in `_active_runs` so the UI's pipeline-status polling can track it.
+    Returns a JobTriggerOut keyed on the Databricks run_id.
+    """
+    job = _find_databricks_job(name_match)
+    if not job:
+        raise HTTPException(404, f"Databricks job containing '{name_match}' not found")
+    job_id = job["job_id"]
+    db = DatabricksClient()
+    result = db.jobs.run_now(job_id, python_params=python_params)
+    db_run_id = str(result.get("run_id", ""))
+    _active_runs[db_run_id] = {
+        "status": "RUNNING",
+        "start_time": datetime.utcnow().isoformat(),
+        "end_time": None,
+        "error": None,
+        "databricks_job_id": job_id,
+        "databricks_run_id": result.get("run_id"),
+    }
+    return JobTriggerOut(run_id=db_run_id, job_id=str(job_id), status="RUNNING")
+
+
+def _status_databricks_job(name_match: str) -> dict:
+    """Common path for the orphan-job status endpoints.
+
+    Returns NOT_FOUND if the bundle job is missing (e.g. someone
+    deployed an older bundle), NEVER_RUN if the job exists but has no
+    run history, and otherwise the latest run's state + run_page_url.
+    """
+    job = _find_databricks_job(name_match)
+    if not job:
+        return {"status": "NOT_FOUND", "message": "Job not configured"}
+    job_id = job["job_id"]
+    db = DatabricksClient()
+    runs = db.api("GET", "/api/2.1/jobs/runs/list", params={"job_id": job_id, "limit": 1})
+    run_list = runs.get("runs", [])
+    if not run_list:
+        return {"status": "NEVER_RUN", "job_id": job_id}
+    run = run_list[0]
+    state = run.get("state", {})
+    life_cycle = state.get("life_cycle_state", "UNKNOWN")
+    result_state = state.get("result_state", "")
+    return {
+        "status": result_state or life_cycle,
+        "life_cycle_state": life_cycle,
+        "result_state": result_state,
+        "run_id": run.get("run_id"),
+        "job_id": job_id,
+        "start_time": run.get("start_time"),
+        "end_time": run.get("end_time"),
+        "run_page_url": run.get("run_page_url", ""),
+    }
+
+
 @router.post("/jobs/enrich-tables", operation_id="triggerTableEnrichJob")
 async def trigger_table_enrich_job(
     batch_size: int = Query(200),
@@ -6129,6 +6203,75 @@ async def table_enrich_job_status() -> dict:
         "end_time": run.get("end_time"),
         "run_page_url": run.get("run_page_url", ""),
     }
+
+
+# ---------------------------------------------------------------------------
+# Orphan-job triggers (B-008 + B-014)
+#
+# Three deployed bundle jobs have always lacked UI buttons. Wiring them
+# here in the strict dependency order they actually require:
+#
+#   1. Source-System Normalization  → gold.source_system_canonical
+#   2. Value Model Build            → gold.program_affiliate_map,
+#                                     use_case_source_requirements,
+#                                     use_case_affiliates  (Stage 4 reads
+#                                     source_system_canonical from job 1)
+#   3. Glossary Builder             → gold.glossary_system_domain
+#                                     (reads canonical sources)
+#
+# The wizard's "Run All (Sequential)" button enforces this order so the
+# B-014 hidden dependency becomes invisible to the user — they never
+# need to know that Value Model Build depends on Normalization.
+# ---------------------------------------------------------------------------
+
+@router.post("/jobs/normalize-sources/run", operation_id="triggerNormalizeSourcesJob")
+async def trigger_normalize_sources_job() -> JobTriggerOut:
+    """Submit the Source-System Normalization job to Databricks.
+
+    Reads silver_tables.source_system (free text from AI Enrich Tables)
+    and produces gold.source_system_canonical + source_system_aliases.
+    Must run before Value Model Build (B-014).
+    """
+    return _trigger_databricks_job("BHE Source-System Normalization")
+
+
+@router.get("/jobs/normalize-sources/status", operation_id="normalizeSourcesJobStatus")
+async def normalize_sources_job_status() -> dict:
+    return _status_databricks_job("BHE Source-System Normalization")
+
+
+@router.post("/jobs/value-model/run", operation_id="triggerValueModelJob")
+async def trigger_value_model_job() -> JobTriggerOut:
+    """Submit the Value Model Build job to Databricks.
+
+    Builds gold.program_affiliate_map, use_case_source_requirements, and
+    use_case_affiliates. Stage 4 maps use_cases onto source_system_canonical
+    (depends on the Normalization job — see B-014). After the 2026-05-12
+    architectural change that removed UC generation from company research,
+    Stage 4 silently no-ops on empty use_cases until the chat path lands.
+    """
+    return _trigger_databricks_job("BHE Value Model Build")
+
+
+@router.get("/jobs/value-model/status", operation_id="valueModelJobStatus")
+async def value_model_job_status() -> dict:
+    return _status_databricks_job("BHE Value Model Build")
+
+
+@router.post("/jobs/glossary/run", operation_id="triggerGlossaryJob")
+async def trigger_glossary_job() -> JobTriggerOut:
+    """Submit the Glossary Builder job to Databricks.
+
+    Reads gold.source_system_canonical and produces
+    gold.glossary_system_domain. Optional / informational — runs last
+    in the sequential pipeline.
+    """
+    return _trigger_databricks_job("BHE Glossary Builder")
+
+
+@router.get("/jobs/glossary/status", operation_id="glossaryJobStatus")
+async def glossary_job_status() -> dict:
+    return _status_databricks_job("BHE Glossary Builder")
 
 
 @router.get("/jobs/company-research/active", operation_id="activeCompanyResearch")

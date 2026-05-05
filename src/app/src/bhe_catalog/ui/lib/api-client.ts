@@ -723,6 +723,9 @@ export interface PipelineStatusResponse {
   enrich_schemas: PipelineJobStatus;
   generate_taxonomy: PipelineJobStatus;
   enrich_tables: PipelineJobStatus;
+  normalize_sources: PipelineJobStatus;
+  value_model: PipelineJobStatus;
+  glossary: PipelineJobStatus;
 }
 
 export async function fetchPipelineStatus(): Promise<PipelineStatusResponse> {
@@ -900,6 +903,42 @@ export async function triggerTableEnrichment(params?: {
 
 export async function fetchTableEnrichmentStatus() {
   const { data } = await api.get("/jobs/enrich-tables/status");
+  return data;
+}
+
+// --- Orphan-job triggers (B-008 + B-014) ---
+// These three jobs ship with the bundle but historically had no UI
+// button; users had to trigger them from Workflows. Wired into Step 7
+// of the wizard in the strict dependency order required by B-014:
+//   normalize-sources → value-model → glossary
+
+export async function triggerNormalizeSourcesJob() {
+  const { data } = await api.post("/jobs/normalize-sources/run");
+  return data;
+}
+
+export async function fetchNormalizeSourcesStatus() {
+  const { data } = await api.get("/jobs/normalize-sources/status");
+  return data;
+}
+
+export async function triggerValueModelJob() {
+  const { data } = await api.post("/jobs/value-model/run");
+  return data;
+}
+
+export async function fetchValueModelStatus() {
+  const { data } = await api.get("/jobs/value-model/status");
+  return data;
+}
+
+export async function triggerGlossaryJob() {
+  const { data } = await api.post("/jobs/glossary/run");
+  return data;
+}
+
+export async function fetchGlossaryStatus() {
+  const { data } = await api.get("/jobs/glossary/status");
   return data;
 }
 
