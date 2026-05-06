@@ -477,6 +477,44 @@ export default function SankeyDiagram({
           );
         }
 
+        // Domain node summary (4-level value Sankey only). Surface the
+        // same conversational signals as source/UC nodes: red = real
+        // gap (no BHE source provides this need), with unlock potential.
+        // Green = at least one source provides it in the affiliate scope.
+        if (node.category === "domain") {
+          const isSat = meta.is_satisfied === true;
+          const desc = (meta.description as string | undefined) || "";
+          const cat = (meta.category as string | undefined) || "";
+          const value = Number(meta.value_usd || 0);
+          const dUnlocksUc = Number(meta.unlocks_uc_count || 0);
+          const dUnlocksValue = Number(meta.unlocks_value_usd || 0);
+          const dUnlocksMust = Number(meta.unlocks_must_have_count || 0);
+          if (cat) tooltipParts.push(`Category: ${cat}`);
+          if (desc) tooltipParts.push(desc);
+          if (!isSat && dUnlocksUc > 0) {
+            const valueLabel =
+              dUnlocksValue >= 1e9
+                ? `$${(dUnlocksValue / 1e9).toFixed(1)}B`
+                : dUnlocksValue >= 1e6
+                  ? `$${(dUnlocksValue / 1e6).toFixed(1)}M`
+                  : dUnlocksValue >= 1e3
+                    ? `$${(dUnlocksValue / 1e3).toFixed(0)}K`
+                    : `$${Math.round(dUnlocksValue)}`;
+            const mustLabel = dUnlocksMust > 0 ? ` (${dUnlocksMust} must-have)` : "";
+            tooltipParts.push(
+              `Gap: no BHE source provides this · unlocks ${dUnlocksUc} UC${dUnlocksUc === 1 ? "" : "s"}${mustLabel} · ${valueLabel}`,
+            );
+          } else if (isSat && value > 0) {
+            const valueLabel =
+              value >= 1e6
+                ? `$${(value / 1e6).toFixed(1)}M`
+                : value >= 1e3
+                  ? `$${(value / 1e3).toFixed(0)}K`
+                  : `$${Math.round(value)}`;
+            tooltipParts.push(`Carries ${valueLabel} of UC value`);
+          }
+        }
+
         // Use-case node summary: readiness % + bucket + $ value. The
         // value-readiness Sankey sets `readiness_pct`, `readiness_bucket`,
         // and `value_usd` on UC nodes; absent on legacy Sankey payloads.

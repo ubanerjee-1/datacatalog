@@ -1607,6 +1607,12 @@ function FlowTab({
           <>
             <div className="flex items-center gap-3 text-xs text-muted-foreground mb-3">
               <span>{meta.source_count ?? 0} sources</span>
+              {meta.levels === 4 && (
+                <>
+                  <span>·</span>
+                  <span>{meta.domain_count ?? 0} data domains</span>
+                </>
+              )}
               <span>·</span>
               <span>{meta.use_case_count ?? 0} use cases shown</span>
               <span>·</span>
@@ -1617,14 +1623,27 @@ function FlowTab({
                   {meta.missing_source_count === 1 ? "" : "s"}
                 </Badge>
               )}
+              {meta.gap_domain_count > 0 && (
+                <Badge variant="outline" className="text-rose-700 border-rose-300">
+                  {meta.gap_domain_count} gap domain
+                  {meta.gap_domain_count === 1 ? "" : "s"}
+                </Badge>
+              )}
             </div>
             <SankeyDiagram
               data={data}
-              columnLabels={["Data Sources", "Use Cases", "Departments"]}
+              columnLabels={
+                // 4-level: source → domain → uc → dept (Phase 3 of the
+                // domain layer rollout). 3-level fallback when the
+                // domain vocab isn't seeded yet.
+                meta.levels === 4
+                  ? ["Data Sources", "Data Domains", "Use Cases", "Departments"]
+                  : ["Data Sources", "Use Cases", "Departments"]
+              }
               showFooter={false}
               onNodeClick={(node) => {
                 // Node ids are prefixed by category in /value/sankey:
-                //   src::<canonical>, uc::<id>, dept::<name>
+                //   src::<canonical>, dom::<name>, uc::<id>, dept::<name>
                 if (node.category === "use_case") {
                   const id = node.id.replace(/^uc::/, "");
                   onSelectUseCase(id);
@@ -1633,6 +1652,7 @@ function FlowTab({
                 } else if (node.category === "source") {
                   onSelectSource(node.name);
                 }
+                // Domain clicks are non-actionable for now (no detail drawer).
               }}
             />
           </>

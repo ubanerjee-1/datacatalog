@@ -272,6 +272,25 @@ home page redirects to `/dashboard` instead of `/company`. (The `Genie`
 pill is optional — the chatbot's typed `app_*` tools work without it; only
 the free-form `genie_ask` fallback needs the Genie space.)
 
+### After the wizard: connect use cases to BHE structure
+
+Steps 1-7 give you a fully enriched catalog. Three additional one-shot
+LLM-assisted actions on **/use-cases** stitch the catalog to BHE-specific
+structure so the Value & Readiness Sankey shows a real readiness story
+(source → data need → use case → department) instead of LLM-guessed
+products like "Snowflake" or "Anaplan":
+
+| Action | What it does | When it's needed |
+|--------|--------------|------------------|
+| **Map programs** | LLM proposes `catalog_prefix → program → affiliate` mappings, writes them to `classification_rules` + `program_affiliate_map`, and auto-fires populate-gold so `silver_schemas.program` backfills | Any time `silver_schemas.program` is mostly `Unknown`/`Other` |
+| **Map data domains** | LLM proposes a closed vocab of *semantic data needs* (`historical_market_prices`, `outage_records`, …) and maps each active source canonical to the domains it serves (`bhe_gold.data_domains` + `bhe_gold.canonical_data_domain_map`) | Once per company; flips the Value & Readiness Sankey from 3 columns to 4 |
+| **Tag UCs with domains** | Backfills `required_data_domains` on existing use cases (those generated before the vocab existed). Idempotent — only touches UCs not yet tagged | Once after building the vocab; subsequent UC generation auto-tags |
+
+Run them in this order. The Sankey on **Value & Readiness** auto-detects
+when the data-domain layer is populated and switches to 4 columns
+(`Data Sources → Data Domains → Use Cases → Departments`) — gap domains
+appear red with an "ingest to unlock N UCs" tooltip.
+
 ### What if I don't want to grant the GRANTs the wizard suggests?
 
 The minimum permission set for the app's service principal is:

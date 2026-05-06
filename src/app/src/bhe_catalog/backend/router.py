@@ -87,6 +87,14 @@ from .models import (
     ProgramsDiscoverIn,
     ProgramsDiscoverOut,
     ProgramDiscoveryProposal,
+    DomainProposal,
+    DomainCanonicalMapping,
+    DomainsDiscoverIn,
+    DomainsDiscoverOut,
+    DomainsDiscoverCommitIn,
+    DomainsDiscoverCommitOut,
+    UseCasesExtractDomainsIn,
+    UseCasesExtractDomainsOut,
     UseCaseAffiliateUpsertIn,
     UseCaseCandidate,
     UseCaseCreateIn,
@@ -365,7 +373,8 @@ _SETUP_SILVER_DDL: dict[str, str] = {
         time_horizon STRING COMMENT 'quick_win|strategic|NULL',
         value_type STRING COMMENT 'cost|revenue|risk|mixed|NULL',
         is_regulatory BOOLEAN,
-        required_canonicals STRING COMMENT 'JSON array of canonical source names',
+        required_canonicals STRING COMMENT 'JSON array of canonical source names (legacy; superseded by required_data_domains)',
+        required_data_domains STRING COMMENT 'JSON array of data_domains.name (semantic data needs)',
         generated_at TIMESTAMP,
         generated_by STRING COMMENT 'llm endpoint id, or "chat" for free-form'
     ) USING DELTA""",
@@ -558,6 +567,52 @@ _SETUP_GOLD_DDL: dict[str, str] = {
         is_user_edited BOOLEAN,
         mapped_at TIMESTAMP
     ) USING DELTA COMMENT 'Gold layer: use case -> applicable affiliates (LLM mapped, analyst-overridable)'""",
+    # ---------- Data domains (semantic data needs) ----------
+    # Closes a long-standing correctness problem with the canonical-driven
+    # readiness Sankey: required_canonicals like 'Snowflake' or 'Anaplan'
+    # are *implementation* names that the LLM picks based on what's
+    # plausible for a workload, not based on what BHE actually uses. The
+    # right abstraction is the data NEED ("historical_market_prices",
+    # "outage_records") and source systems are then mapped to the needs
+    # they satisfy. This unblocks "you need outage records, here are the
+    # 3 BHE sources that provide them" instead of the misleading "you
+    # don't have ServiceNow specifically".
+    "data_domains": """CREATE TABLE IF NOT EXISTS {fqn} (
+        domain_id STRING NOT NULL COMMENT 'snake_case stable id, e.g. dom_a1b2c3d4e5f6',
+        name STRING NOT NULL COMMENT 'snake_case key, e.g. historical_market_prices',
+        label STRING NOT NULL COMMENT 'Display label, e.g. Historical Market Prices',
+        description STRING COMMENT 'One-sentence description of what data is in this domain',
+        category STRING COMMENT 'trading | operations | customer | asset | finance | risk | regulatory | external',
+        example_attributes STRING COMMENT 'comma-separated example fields, e.g. price_at_hour, settlement_point, market_id',
+        is_active BOOLEAN,
+        is_user_edited BOOLEAN COMMENT 'true = manual edit; never overwritten by job',
+        created_at TIMESTAMP,
+        updated_at TIMESTAMP
+    ) USING DELTA COMMENT 'Gold layer: closed vocabulary of semantic data needs (decouples value model from specific source-system products)'""",
+    # M:N bridge between BHE source-system canonicals and the data domains
+    # they typically serve. Populated alongside the domain vocab via
+    # /api/domains/discover (one ai_query covers both).
+    "canonical_data_domain_map": """CREATE TABLE IF NOT EXISTS {fqn} (
+        canonical STRING NOT NULL COMMENT 'FK -> source_system_canonical.canonical',
+        domain_name STRING NOT NULL COMMENT 'FK -> data_domains.name',
+        confidence STRING COMMENT 'high | medium | low',
+        notes STRING COMMENT 'LLM rationale or analyst note',
+        is_user_edited BOOLEAN,
+        mapped_at TIMESTAMP,
+        updated_at TIMESTAMP
+    ) USING DELTA COMMENT 'Gold layer: bridge canonical source-system -> data domains it serves (M:N)'""",
+    # New UC requirement layer keyed on data_domain. Replaces the
+    # canonical-keyed use_case_source_requirements path going forward
+    # (the latter stays for back-compat until cleanup).
+    "use_case_data_requirements": """CREATE TABLE IF NOT EXISTS {fqn} (
+        use_case_id STRING NOT NULL COMMENT 'FK -> use_cases.id',
+        data_domain STRING NOT NULL COMMENT 'FK -> data_domains.name',
+        necessity STRING COMMENT 'must_have | nice_to_have',
+        rationale STRING COMMENT 'Why this UC needs this domain',
+        mapped_by STRING COMMENT 'generation | extraction | manual',
+        is_user_edited BOOLEAN,
+        mapped_at TIMESTAMP
+    ) USING DELTA COMMENT 'Gold layer: use case -> required data domains (semantic, decoupled from specific source systems)'""",
     "source_system_canonical": """CREATE TABLE IF NOT EXISTS {fqn} (
         canonical STRING NOT NULL COMMENT 'Canonical source-system name (primary key)',
         category STRING COMMENT 'Category bucket (ERP, CIS, Historian, ...)',
@@ -1724,6 +1779,15 @@ def _ensure_use_case_status_columns() -> None:
         if "required_canonicals" not in existing:
             to_add.append(
                 "required_canonicals STRING COMMENT 'JSON array of canonical source names'"
+            )
+        # Wave 4: data-domain layer (semantic data needs decoupled from
+        # specific source-system products). UCs generated before this column
+        # was added will have NULL until the extract-data-domains endpoint
+        # is run; readiness queries fall back to required_canonicals when
+        # this is empty.
+        if "required_data_domains" not in existing:
+            to_add.append(
+                "required_data_domains STRING COMMENT 'JSON array of data_domains.name (semantic data needs)'"
             )
         if "generated_at" not in existing:
             to_add.append("generated_at TIMESTAMP")
@@ -3116,6 +3180,498 @@ async def value_source_detail(
     }
 
 
+def _value_sankey_4level(
+    *,
+    affiliate: Optional[str],
+    priority: Optional[str],
+    department: Optional[str],
+    search: Optional[str],
+    formula: str,
+    top_use_cases: int,
+    silver: str,
+    gold: str,
+) -> dict:
+    """4-level value-weighted Sankey: source -> data domain -> use case -> department.
+
+    Same value-flow philosophy as the 3-level version, but UC value
+    splits across its required *data domains* first; each domain's share
+    then splits across the BHE source canonicals that actually provide
+    it (and are present in the affiliate's lake slice). A domain with no
+    providing source still appears as a node but has no incoming source
+    link — that's the new, sharper "gap" signal: the data NEED is
+    unsatisfied by anything BHE has, regardless of which product is
+    typical for it elsewhere.
+    """
+    present_cte, join_sql, where_sql = _build_value_filters(
+        affiliate=affiliate, priority=priority, search=search,
+        department=department, silver=silver, gold=gold,
+    )
+
+    if formula == "must":
+        num_expr = "SUM(CASE WHEN necessity='must_have' THEN is_satisfied ELSE 0 END)"
+        den_expr = "COUNT(CASE WHEN necessity='must_have' THEN 1 END)"
+    else:
+        num_expr = "SUM(is_satisfied)"
+        den_expr = "COUNT(*)"
+
+    sql = f"""
+        WITH {present_cte},
+        scoped_uc AS (
+            SELECT uc.id, uc.use_case_name,
+                   COALESCE(uc.estimated_value_usd, 0) AS value,
+                   COALESCE(NULLIF(TRIM(uc.department), ''), 'Unassigned') AS department
+            FROM {fqn(silver, 'use_cases')} uc
+            {join_sql}
+            {where_sql}
+        ),
+        uc_domain AS (
+            -- One row per (uc, required domain). Drives readiness AND the
+            -- domain->uc link weights.
+            SELECT u.id AS uc_id, u.use_case_name, u.value, u.department,
+                   r.data_domain, COALESCE(r.necessity, 'must_have') AS necessity
+            FROM scoped_uc u
+            JOIN {fqn(gold, 'use_case_data_requirements')} r
+              ON r.use_case_id = u.id
+            WHERE r.data_domain IS NOT NULL AND TRIM(r.data_domain) <> ''
+        ),
+        domain_satisfaction AS (
+            -- For each (uc, domain): is_satisfied=1 iff at least one
+            -- mapped canonical for the domain is present in the
+            -- affiliate scope (the `present` CTE).
+            SELECT ud.uc_id, ud.use_case_name, ud.value, ud.department,
+                   ud.data_domain, ud.necessity,
+                   MAX(CASE WHEN p.canonical IS NOT NULL THEN 1 ELSE 0 END) AS is_satisfied
+            FROM uc_domain ud
+            LEFT JOIN {fqn(gold, 'canonical_data_domain_map')} m
+                   ON LOWER(m.domain_name) = LOWER(ud.data_domain)
+            LEFT JOIN present p ON p.canonical = m.canonical
+            GROUP BY ud.uc_id, ud.use_case_name, ud.value, ud.department,
+                     ud.data_domain, ud.necessity
+        ),
+        readiness AS (
+            SELECT uc_id,
+                   MAX(use_case_name) AS use_case_name,
+                   MAX(value) AS value,
+                   MAX(department) AS department,
+                   {num_expr} AS num,
+                   {den_expr} AS den
+            FROM domain_satisfaction
+            GROUP BY uc_id
+        ),
+        ranked_uc AS (
+            SELECT uc_id, use_case_name, value, department, num, den,
+                   ROW_NUMBER() OVER (ORDER BY value DESC) AS rnk
+            FROM readiness
+        ),
+        top_uc AS (
+            SELECT * FROM ranked_uc WHERE rnk <= {int(top_use_cases)}
+        ),
+        ds_top AS (
+            -- Restrict to the top-N UCs for the link computations.
+            SELECT ds.* FROM domain_satisfaction ds
+            JOIN top_uc t ON t.uc_id = ds.uc_id
+        ),
+        uc_dom_count AS (
+            SELECT uc_id, COUNT(*) AS n_dom FROM ds_top GROUP BY uc_id
+        ),
+        ds_with_count AS (
+            -- Each (uc, domain, is_satisfied) joined with the domain
+            -- count for that UC so downstream value math is local (no
+            -- correlated subqueries — Spark handles those but they're
+            -- a portability hazard).
+            SELECT ds.uc_id, ds.use_case_name, ds.value, ds.department,
+                   ds.data_domain, ds.necessity, ds.is_satisfied,
+                   c.n_dom
+            FROM ds_top ds
+            JOIN uc_dom_count c ON c.uc_id = ds.uc_id
+        ),
+        link_dom_uc AS (
+            -- domain -> uc link value = uc.value / # required domains
+            SELECT data_domain, uc_id, MAX(use_case_name) AS use_case_name,
+                   SUM(value / NULLIF(n_dom, 0)) AS link_value
+            FROM ds_with_count
+            GROUP BY data_domain, uc_id
+        ),
+        -- Domain meta: total value flowing through it (sum of dom->uc
+        -- link values), and is_satisfied = 1 iff ANY scoped UC's
+        -- (uc, domain) pair is satisfied.
+        domain_meta AS (
+            SELECT data_domain,
+                   MAX(is_satisfied) AS is_satisfied,
+                   SUM(value / NULLIF(n_dom, 0)) AS total_value
+            FROM ds_with_count
+            GROUP BY data_domain
+        ),
+        -- Source -> domain links: only when the source is present AND
+        -- the domain is needed by some scoped UC. Distribute the
+        -- domain's total_value evenly across its providing canonicals
+        -- (the user can refine this later via confidence weighting).
+        domain_providers AS (
+            SELECT m.domain_name AS data_domain, m.canonical
+            FROM {fqn(gold, 'canonical_data_domain_map')} m
+            JOIN present p ON p.canonical = m.canonical
+            JOIN domain_meta dm ON LOWER(dm.data_domain) = LOWER(m.domain_name)
+        ),
+        provider_count AS (
+            SELECT data_domain, COUNT(*) AS n_prov
+            FROM domain_providers
+            GROUP BY data_domain
+        ),
+        link_src_dom AS (
+            SELECT dp.canonical, dp.data_domain,
+                   dm.total_value / NULLIF(pc.n_prov, 0) AS link_value
+            FROM domain_providers dp
+            JOIN domain_meta dm ON LOWER(dm.data_domain) = LOWER(dp.data_domain)
+            JOIN provider_count pc ON pc.data_domain = dp.data_domain
+        ),
+        src_meta_used AS (
+            -- For source-node coloring: a source is "active" in this
+            -- scope iff it provides any required domain via link_src_dom.
+            SELECT canonical,
+                   COUNT(DISTINCT data_domain) AS domains_served,
+                   SUM(link_value) AS value_carried
+            FROM link_src_dom
+            GROUP BY canonical
+        ),
+        -- Unlock potential: ingesting a *gap* domain's plausible
+        -- canonicals (mapped but not present) would unlock these UCs.
+        gap_domain_meta AS (
+            SELECT data_domain,
+                   COUNT(DISTINCT uc_id) AS unlocks_uc_count,
+                   SUM(value / NULLIF(n_dom, 0)) AS unlocks_value_usd,
+                   COUNT(DISTINCT CASE WHEN necessity='must_have'
+                                       THEN uc_id END) AS unlocks_must_have_count
+            FROM ds_with_count
+            WHERE is_satisfied = 0
+            GROUP BY data_domain
+        ),
+        -- Domain meta joined with gap-domain-meta so we don't need a
+        -- correlated subquery in the outer UNION ALL projection.
+        domain_meta_full AS (
+            SELECT dm.data_domain, dm.is_satisfied, dm.total_value,
+                   g.unlocks_uc_count, g.unlocks_value_usd, g.unlocks_must_have_count
+            FROM domain_meta dm
+            LEFT JOIN gap_domain_meta g ON g.data_domain = dm.data_domain
+        )
+
+        -- Multi-shape result: kind discriminates row type. Explicit
+        -- CASTs on the first UNION branch let Spark infer column types
+        -- without relying on later branches (NULL columns are typed
+        -- as 'void' otherwise and can break the UNION schema).
+        SELECT 'src_dom' AS kind,
+               CAST(canonical AS STRING) AS a,
+               CAST(data_domain AS STRING) AS b,
+               CAST(link_value AS DOUBLE) AS link_value,
+               CAST(NULL AS STRING) AS uc_id,
+               CAST(NULL AS STRING) AS use_case_name,
+               CAST(NULL AS DOUBLE) AS uc_value,
+               CAST(NULL AS BIGINT) AS num,
+               CAST(NULL AS BIGINT) AS den,
+               CAST(NULL AS STRING) AS department,
+               CAST(NULL AS INT) AS is_satisfied,
+               CAST(NULL AS BIGINT) AS unlocks_uc_count,
+               CAST(NULL AS DOUBLE) AS unlocks_value_usd,
+               CAST(NULL AS BIGINT) AS unlocks_must_have_count,
+               CAST(NULL AS BIGINT) AS domains_served,
+               CAST(NULL AS DOUBLE) AS value_carried
+        FROM link_src_dom
+
+        UNION ALL
+        SELECT 'dom_uc' AS kind,
+               CAST(data_domain AS STRING) AS a, CAST(uc_id AS STRING) AS b,
+               CAST(link_value AS DOUBLE) AS link_value,
+               CAST(uc_id AS STRING) AS uc_id,
+               CAST(use_case_name AS STRING) AS use_case_name,
+               CAST(NULL AS DOUBLE), CAST(NULL AS BIGINT), CAST(NULL AS BIGINT),
+               CAST(NULL AS STRING),
+               CAST(NULL AS INT),
+               CAST(NULL AS BIGINT), CAST(NULL AS DOUBLE), CAST(NULL AS BIGINT),
+               CAST(NULL AS BIGINT), CAST(NULL AS DOUBLE)
+        FROM link_dom_uc
+
+        UNION ALL
+        SELECT 'uc_dept' AS kind,
+               CAST(uc_id AS STRING) AS a, CAST(department AS STRING) AS b,
+               CAST(value AS DOUBLE) AS link_value,
+               CAST(uc_id AS STRING) AS uc_id,
+               CAST(use_case_name AS STRING) AS use_case_name,
+               CAST(value AS DOUBLE) AS uc_value,
+               CAST(num AS BIGINT) AS num, CAST(den AS BIGINT) AS den,
+               CAST(department AS STRING) AS department,
+               CAST(NULL AS INT),
+               CAST(NULL AS BIGINT), CAST(NULL AS DOUBLE), CAST(NULL AS BIGINT),
+               CAST(NULL AS BIGINT), CAST(NULL AS DOUBLE)
+        FROM top_uc
+
+        UNION ALL
+        SELECT 'dom_meta' AS kind,
+               CAST(data_domain AS STRING) AS a, CAST(NULL AS STRING) AS b,
+               CAST(total_value AS DOUBLE) AS link_value,
+               CAST(NULL AS STRING), CAST(NULL AS STRING),
+               CAST(NULL AS DOUBLE), CAST(NULL AS BIGINT), CAST(NULL AS BIGINT),
+               CAST(NULL AS STRING),
+               CAST(is_satisfied AS INT) AS is_satisfied,
+               CAST(unlocks_uc_count AS BIGINT) AS unlocks_uc_count,
+               CAST(unlocks_value_usd AS DOUBLE) AS unlocks_value_usd,
+               CAST(unlocks_must_have_count AS BIGINT) AS unlocks_must_have_count,
+               CAST(NULL AS BIGINT), CAST(NULL AS DOUBLE)
+        FROM domain_meta_full
+
+        UNION ALL
+        SELECT 'src_meta' AS kind,
+               CAST(canonical AS STRING) AS a, CAST(NULL AS STRING) AS b,
+               CAST(value_carried AS DOUBLE) AS link_value,
+               CAST(NULL AS STRING), CAST(NULL AS STRING),
+               CAST(NULL AS DOUBLE), CAST(NULL AS BIGINT), CAST(NULL AS BIGINT),
+               CAST(NULL AS STRING),
+               CAST(NULL AS INT),
+               CAST(NULL AS BIGINT), CAST(NULL AS DOUBLE), CAST(NULL AS BIGINT),
+               CAST(domains_served AS BIGINT) AS domains_served,
+               CAST(value_carried AS DOUBLE) AS value_carried
+        FROM src_meta_used
+    """
+
+    try:
+        rows = execute_query(sql)
+    except Exception as e:
+        logger.warning(f"value_sankey (4-level) failed: {e}")
+        return {"nodes": [], "links": [], "metadata": {"error": str(e)}}
+
+    src_dom_links: list[dict] = []
+    dom_uc_links: list[dict] = []
+    uc_dept_links: list[dict] = []
+    domain_meta_map: dict[str, dict] = {}
+    src_meta_map: dict[str, dict] = {}
+    uc_meta: dict[str, dict] = {}
+
+    for r in rows:
+        kind = r.get("kind")
+        if kind == "src_dom":
+            v = float(r.get("link_value") or 0)
+            if v > 0 and r.get("a") and r.get("b"):
+                src_dom_links.append({
+                    "source": r.get("a"), "target": r.get("b"), "value": v,
+                })
+        elif kind == "dom_uc":
+            v = float(r.get("link_value") or 0)
+            if v > 0 and r.get("b"):
+                dom_uc_links.append({
+                    "source": r.get("a"), "target": r.get("b"), "value": v,
+                })
+        elif kind == "uc_dept":
+            v = float(r.get("link_value") or 0)
+            uc_id = r.get("uc_id")
+            dept = r.get("department") or "Unassigned"
+            if uc_id:
+                uc_dept_links.append({
+                    "source": uc_id, "target": dept,
+                    "value": v if v > 0 else 1,
+                })
+                uc_meta[uc_id] = {
+                    "name": r.get("use_case_name"),
+                    "value": float(r.get("uc_value") or 0),
+                    "num": _to_int(r.get("num")),
+                    "den": _to_int(r.get("den")),
+                    "department": dept,
+                }
+        elif kind == "dom_meta":
+            dn = r.get("a")
+            if dn:
+                domain_meta_map[dn] = {
+                    "is_satisfied": bool(_to_int(r.get("is_satisfied"))),
+                    "total_value": float(r.get("link_value") or 0),
+                    "unlocks_uc_count": _to_int(r.get("unlocks_uc_count")),
+                    "unlocks_value_usd": float(r.get("unlocks_value_usd") or 0),
+                    "unlocks_must_have_count": _to_int(r.get("unlocks_must_have_count")),
+                }
+        elif kind == "src_meta":
+            cn = r.get("a")
+            if cn:
+                src_meta_map[cn] = {
+                    "domains_served": _to_int(r.get("domains_served")),
+                    "value_carried": float(r.get("value_carried") or 0),
+                }
+
+    # Read display labels for domains so the Sankey nodes show
+    # human-friendly names rather than the snake_case keys.
+    domain_labels: dict[str, str] = {}
+    if domain_meta_map:
+        try:
+            domain_rows = execute_query(
+                f"SELECT name, label, description, category FROM "
+                f"{fqn(gold, 'data_domains')} "
+                f"WHERE LOWER(name) IN ("
+                + ", ".join(
+                    f"LOWER('{_sql_escape(n)}')" for n in domain_meta_map.keys()
+                )
+                + ")"
+            )
+            for d in domain_rows or []:
+                key = (d.get("name") or "").strip()
+                if key:
+                    domain_labels[key] = {
+                        "label": d.get("label") or key,
+                        "description": d.get("description") or "",
+                        "category": d.get("category") or "",
+                    }
+        except Exception:
+            pass
+
+    sources = sorted({l["source"] for l in src_dom_links})
+    domains = sorted(domain_meta_map.keys())
+    use_cases = list(uc_meta.keys())
+    departments = sorted({l["target"] for l in uc_dept_links})
+
+    nodes: list[dict] = []
+    for name in sources:
+        m = src_meta_map.get(name) or {}
+        # In 4-level mode, "is_present" of the source is implicit (it
+        # only shows up in src_meta if it's present and serving a needed
+        # domain). Color reflects whether it's actively wired into a
+        # domain in scope.
+        nodes.append({
+            "id": f"src::{name}",
+            "name": name,
+            "category": "source",
+            "level": 0,
+            "color": "hsl(174, 80%, 55%)",
+            "metadata": {
+                "is_present": True,
+                "is_gap": False,
+                "domains_served": m.get("domains_served", 0),
+                "value_carried": m.get("value_carried", 0.0),
+            },
+        })
+
+    for dn in domains:
+        meta = domain_meta_map.get(dn) or {}
+        info = domain_labels.get(dn) or {}
+        is_sat = bool(meta.get("is_satisfied"))
+        nodes.append({
+            "id": f"dom::{dn}",
+            "name": info.get("label") or dn.replace("_", " ").title(),
+            "category": "domain",
+            "level": 1,
+            # Green = at least one BHE source provides this in scope;
+            # Red = real gap (data NEED that nothing BHE has covers).
+            "color": "hsl(140, 60%, 45%)" if is_sat else "hsl(0, 75%, 55%)",
+            "metadata": {
+                "domain_name": dn,
+                "description": info.get("description") or "",
+                "category": info.get("category") or "",
+                "is_satisfied": is_sat,
+                "is_gap": not is_sat,
+                "value_usd": meta.get("total_value", 0.0),
+                "unlocks_uc_count": meta.get("unlocks_uc_count", 0),
+                "unlocks_value_usd": meta.get("unlocks_value_usd", 0.0),
+                "unlocks_must_have_count": meta.get("unlocks_must_have_count", 0),
+            },
+        })
+
+    for uc_id in use_cases:
+        m = uc_meta[uc_id]
+        ratio = (m["num"] / m["den"]) if m["den"] > 0 else 0
+        if ratio >= 1.0:
+            color = "hsl(140, 60%, 45%)"
+            bucket = "ready"
+        elif ratio >= 0.75:
+            color = "hsl(80, 60%, 50%)"
+            bucket = "near_ready"
+        elif ratio >= 0.50:
+            color = "hsl(45, 80%, 55%)"
+            bucket = "partial"
+        elif ratio >= 0.25:
+            color = "hsl(25, 80%, 55%)"
+            bucket = "low"
+        else:
+            color = "hsl(0, 75%, 55%)"
+            bucket = "missing"
+        nodes.append({
+            "id": f"uc::{uc_id}",
+            "name": m["name"],
+            "category": "use_case",
+            "level": 2,
+            "color": color,
+            "metadata": {
+                "value_usd": m["value"],
+                "readiness_pct": round(100 * ratio, 1),
+                "readiness_bucket": bucket,
+                "num": m["num"], "den": m["den"],
+                "department": m["department"],
+            },
+        })
+
+    for name in departments:
+        nodes.append({
+            "id": f"dept::{name}",
+            "name": name,
+            "category": "department",
+            "level": 3,
+            "color": "hsl(350, 75%, 60%)",
+        })
+
+    links: list[dict] = []
+    for l in src_dom_links:
+        links.append({
+            "source": f"src::{l['source']}",
+            "target": f"dom::{l['target']}",
+            "value": l["value"],
+            "color": "rgba(120, 200, 180, 0.30)",
+        })
+    for l in dom_uc_links:
+        links.append({
+            "source": f"dom::{l['source']}",
+            "target": f"uc::{l['target']}",
+            "value": l["value"],
+            "color": "rgba(180, 200, 140, 0.30)",
+        })
+    for l in uc_dept_links:
+        links.append({
+            "source": f"uc::{l['source']}",
+            "target": f"dept::{l['target']}",
+            "value": l["value"],
+            "color": "rgba(160, 140, 220, 0.25)",
+        })
+
+    gap_count = sum(1 for d in domains if not domain_meta_map[d].get("is_satisfied"))
+    return {
+        "nodes": nodes,
+        "links": links,
+        "metadata": {
+            "levels": 4,
+            "source_count": len(sources),
+            "domain_count": len(domains),
+            "use_case_count": len(use_cases),
+            "department_count": len(departments),
+            "gap_domain_count": gap_count,
+            "filters": {
+                "affiliate": affiliate, "priority": priority,
+                "department": department,
+                "search": search, "formula": formula,
+                "top_use_cases": top_use_cases,
+            },
+        },
+    }
+
+
+def _data_domains_in_use(gold: str) -> bool:
+    """Return True iff there is at least one row in gold.use_case_data_requirements.
+
+    Drives the Sankey's 3-level vs 4-level fallback. We don't just check
+    the vocab table — a populated vocab with zero UC requirements would
+    still render a 4th column with no incoming domain→uc links, which
+    looks broken. The presence of at least one requirement row is what
+    actually makes the 4-level diagram useful.
+    """
+    try:
+        rows = execute_query(
+            f"SELECT 1 FROM {fqn(gold, 'use_case_data_requirements')} LIMIT 1"
+        )
+        return bool(rows)
+    except Exception:
+        return False
+
+
 @router.get("/value/sankey", operation_id="valueSankey")
 async def value_sankey(
     affiliate: Optional[str] = Query(None),
@@ -3131,23 +3687,59 @@ async def value_sankey(
         description="Cap on number of use cases shown (highest $ first) to keep "
                     "the diagram readable.",
     ),
+    levels: str = Query(
+        "auto",
+        regex="^(auto|3|4)$",
+        description=(
+            "auto = 4-level (source->domain->uc->dept) when the data domain "
+            "layer is populated, else 3-level (source->uc->dept). "
+            "3 = force legacy 3-level; 4 = force 4-level (errors if vocab empty)."
+        ),
+    ),
 ) -> dict:
-    """
-    Three-level value-weighted Sankey: source -> use case -> department.
+    """Value-weighted readiness Sankey.
 
-    - Link width = $ value carried. Use-case value is distributed evenly
-      across its required canonical sources for the source -> use-case
-      links; the full use-case value flows through to its owning
-      department.
-    - Source nodes are colored by presence (red = missing canonical, the
-      'investment unlock' signal).
+    With data domains populated (Phase 2+), this returns 4 columns
+    (source -> domain -> uc -> dept). On a fresh deploy with no domains
+    yet, it falls back to the legacy 3 columns (source -> uc -> dept) so
+    the page still works.
+
+    - Link width = $ value carried. UC value is distributed across its
+      required domains; each domain's share is then distributed across
+      the source canonicals that provide it.
+    - Source nodes are colored by presence (red = no scoped UC needs a
+      domain this source provides, the 'investment unlock' signal).
+    - Domain nodes are colored by satisfaction (red = no BHE source
+      provides this domain in the affiliate scope = real gap).
     - Use case nodes are colored by readiness bucket.
-    - Use cases without a department fall back to an 'Unassigned' bucket
-      so they still show up on the right.
     Compatible with the existing SankeyDiagram component shape.
     """
     silver = get_silver_schema()
     gold = get_gold_schema()
+
+    # Pick the layout mode.
+    if levels == "4":
+        if not _data_domains_in_use(gold):
+            raise HTTPException(
+                412,
+                "levels=4 requested but the data-domain layer isn't "
+                "populated yet. Run /api/domains/discover (and commit) "
+                "and /api/use-cases/extract-data-domains first, or "
+                "use levels=auto / levels=3.",
+            )
+        use_4level = True
+    elif levels == "3":
+        use_4level = False
+    else:  # auto
+        use_4level = _data_domains_in_use(gold)
+
+    if use_4level:
+        return _value_sankey_4level(
+            affiliate=affiliate, priority=priority, department=department,
+            search=search, formula=formula, top_use_cases=top_use_cases,
+            silver=silver, gold=gold,
+        )
+    # Fall through to the legacy 3-level path (kept verbatim below).
     present_cte, join_sql, where_sql = _build_value_filters(
         affiliate=affiliate, priority=priority, search=search,
         department=department, silver=silver, gold=gold,
@@ -3413,6 +4005,7 @@ async def value_sankey(
         "nodes": nodes,
         "links": links,
         "metadata": {
+            "levels": 3,
             "source_count": len(sources),
             "use_case_count": len(use_cases),
             "department_count": len(departments),
@@ -4469,6 +5062,7 @@ async def list_use_cases(
                 value_type=r.get("value_type") or None,
                 is_regulatory=_to_bool(r.get("is_regulatory")) if r.get("is_regulatory") is not None else None,
                 required_canonicals=_raw_reqs(r.get("required_canonicals", "[]")),
+                required_data_domains=_raw_reqs(r.get("required_data_domains", "[]")),
             )
             for r in rows
         ]
@@ -4781,12 +5375,21 @@ _GENERATED_UC_RESPONSE_SCHEMA: str = json.dumps({
                                 "type": "array",
                                 "items": {"type": "string"},
                             },
+                            # Phase 2: semantic data needs from the closed
+                            # `data_domains` vocab. The LLM is told to leave
+                            # this empty if the vocab is empty, so older
+                            # deployments still pass schema validation.
+                            "required_data_domains": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                            },
                         },
                         "required": [
                             "use_case_name", "description", "business_value",
                             "priority", "category", "lens",
                             "time_horizon", "value_type", "is_regulatory",
                             "data_requirements", "required_canonicals",
+                            "required_data_domains",
                         ],
                     },
                 },
@@ -4905,6 +5508,28 @@ def _resolve_canonicals_for_affiliate(affiliate: str) -> tuple[list[dict], list[
     return present, missing
 
 
+def _load_data_domains_vocab() -> list[dict]:
+    """Return the active data-domain vocab, or [] if not yet seeded.
+
+    Used by UC generation + extraction to constrain the LLM to a closed set
+    of semantic data needs. When the vocab is empty (fresh deploy that
+    hasn't run /api/domains/discover yet), generation falls back to the
+    legacy canonical-only path so we don't block UC creation on a dependency.
+    """
+    gold = get_gold_schema()
+    try:
+        rows = execute_query(
+            f"SELECT name, label, description, category, example_attributes "
+            f"FROM {fqn(gold, 'data_domains')} "
+            f"WHERE COALESCE(is_active, true) = true "
+            f"ORDER BY category, name"
+        )
+        return rows or []
+    except Exception as e:
+        logger.warning(f"_load_data_domains_vocab failed: {e}")
+        return []
+
+
 def _build_uc_generation_prompt(
     *,
     company_profile: dict,
@@ -4914,6 +5539,7 @@ def _build_uc_generation_prompt(
     count: int,
     canonicals_present: list[dict],
     canonicals_missing: list[str],
+    data_domains_vocab: list[dict],
     time_horizon_bias: str,
     value_type_bias: str,
     prioritize_regulatory: bool,
@@ -5003,6 +5629,40 @@ def _build_uc_generation_prompt(
              "by a regulatory requirement; otherwise false."
     )
 
+    # Render the data-domain vocab the LLM is allowed to draw from. Grouped
+    # by category so the model can reason about fit. When empty (vocab not
+    # yet seeded), tell the model explicitly to leave required_data_domains
+    # as [] — the schema still requires the field but [] is acceptable in
+    # bootstrap mode.
+    if data_domains_vocab:
+        by_cat: dict[str, list[str]] = {}
+        for d in data_domains_vocab:
+            cat = (d.get("category") or "other").strip().lower() or "other"
+            label = (d.get("label") or d.get("name") or "").strip()
+            name = (d.get("name") or "").strip()
+            desc = (d.get("description") or "").strip()
+            ex = (d.get("example_attributes") or "").strip()
+            line = f"  - `{name}` — {label}"
+            if desc:
+                line += f": {desc}"
+            if ex:
+                line += f" (example fields: {ex})"
+            by_cat.setdefault(cat, []).append(line)
+        domain_lines = []
+        for cat in sorted(by_cat.keys()):
+            domain_lines.append(f"[{cat}]")
+            domain_lines.extend(by_cat[cat])
+        domain_vocab_block = (
+            "DATA DOMAINS (closed vocabulary — `required_data_domains` MUST "
+            "use these `name` keys exactly):\n" + "\n".join(domain_lines)
+        )
+    else:
+        domain_vocab_block = (
+            "DATA DOMAINS: vocabulary not yet populated. Return "
+            "`required_data_domains: []` (the legacy `required_canonicals` "
+            "list is still required and is the active source-of-truth)."
+        )
+
     prompt = f"""You are a senior data strategy consultant for {company_name}.
 Industry: {industry} / {sub_industry}
 Regulatory environment: {regulatory_env}
@@ -5042,6 +5702,9 @@ For EACH use case return:
 - is_regulatory: true | false
 - data_requirements: 2-5 short bullet strings describing the data needed
 - required_canonicals: array of canonical source names. For "ready" use cases pick names from the AVAILABLE list. For "gap" use cases pick names from the MISSING list. Use exact names. Empty array is INVALID.
+- required_data_domains: array of data-domain `name` keys (semantic data needs, e.g. "historical_market_prices"). MUST come from the DATA DOMAINS vocab below. Empty array is INVALID when vocab is non-empty. These describe WHAT data the UC needs, decoupled from WHICH source provides it (a single domain may be served by multiple canonicals).
+
+{domain_vocab_block}
 
 Generate exactly {count} use case(s). Return JSON matching the schema."""
     return prompt
@@ -5165,6 +5828,9 @@ async def generate_use_cases(body: UseCaseGenerateIn) -> UseCaseGenerateOut:
             "normalize-source-systems job first, or use lens=gap.",
         )
 
+    domains_vocab = _load_data_domains_vocab()
+    valid_domain_names = {(d.get("name") or "").strip() for d in domains_vocab if d.get("name")}
+
     prompt = _build_uc_generation_prompt(
         company_profile=profile,
         affiliate=affiliate_row,
@@ -5173,6 +5839,7 @@ async def generate_use_cases(body: UseCaseGenerateIn) -> UseCaseGenerateOut:
         count=count,
         canonicals_present=canonicals_present,
         canonicals_missing=canonicals_missing,
+        data_domains_vocab=domains_vocab,
         time_horizon_bias=time_horizon,
         value_type_bias=value_type,
         prioritize_regulatory=bool(body.prioritize_regulatory),
@@ -5234,6 +5901,13 @@ async def generate_use_cases(body: UseCaseGenerateIn) -> UseCaseGenerateOut:
             required_canonicals=[
                 str(x) for x in (it.get("required_canonicals") or []) if x
             ],
+            # Filter LLM output to only domains that exist in the vocab —
+            # protects against hallucinated names slipping through schema
+            # validation. Empty in bootstrap mode (vocab not seeded yet).
+            required_data_domains=[
+                str(x).strip() for x in (it.get("required_data_domains") or [])
+                if x and (not valid_domain_names or str(x).strip() in valid_domain_names)
+            ] if valid_domain_names else [],
         ))
 
     if not candidates:
@@ -5331,6 +6005,8 @@ async def commit_generated_use_cases(
         new_id = f"uc_{uuid.uuid4().hex[:12]}"
         dr_json = json.dumps(list(cand.get("data_requirements") or []))
         rc_json = json.dumps(list(cand.get("required_canonicals") or []))
+        rdd_list = list(cand.get("required_data_domains") or [])
+        rdd_json = json.dumps(rdd_list)
         est = cand.get("estimated_value_usd")
         est_sql = (
             f"{float(est)}" if isinstance(est, (int, float)) else "NULL"
@@ -5345,7 +6021,8 @@ async def commit_generated_use_cases(
                      value_rationale, data_requirements, status, status_notes,
                      status_updated_at, created_at, is_user_edited, company_name,
                      affiliate, lens, time_horizon, value_type, is_regulatory,
-                     required_canonicals, generated_at, generated_by)
+                     required_canonicals, required_data_domains, generated_at,
+                     generated_by)
                 VALUES (
                     '{_sql_escape(new_id)}',
                     '{_sql_escape(name)}',
@@ -5369,11 +6046,38 @@ async def commit_generated_use_cases(
                     {f"'{_sql_escape(vt)}'" if vt else 'NULL'},
                     {str(bool(cand.get('is_regulatory'))).lower()},
                     '{_sql_escape(rc_json)}',
+                    '{_sql_escape(rdd_json)}',
                     current_timestamp(),
                     '{_sql_escape(LLM_ENDPOINT)}'
                 )
             """)
             inserted.append(new_id)
+
+            # Phase 2: also write rows to gold.use_case_data_requirements so
+            # the 4-level Sankey can join through data domains. Necessity is
+            # 'must_have' by default; the LLM doesn't differentiate at
+            # generation time so a downstream pass can refine.
+            if rdd_list:
+                try:
+                    _ensure_data_domain_tables()
+                    gold = get_gold_schema()
+                    rows_sql = ", ".join(
+                        f"('{_sql_escape(new_id)}', '{_sql_escape(d)}', "
+                        f"'must_have', 'Generated alongside use case', "
+                        f"'generation', false, current_timestamp())"
+                        for d in rdd_list
+                    )
+                    execute_query(f"""
+                        INSERT INTO {fqn(gold, 'use_case_data_requirements')}
+                            (use_case_id, data_domain, necessity, rationale,
+                             mapped_by, is_user_edited, mapped_at)
+                        VALUES {rows_sql}
+                    """)
+                except Exception as e:
+                    logger.warning(
+                        f"commit: writing use_case_data_requirements for "
+                        f"{new_id!r} failed: {e}"
+                    )
         except Exception as e:
             logger.warning(f"commit insert failed for {name!r}: {e}")
             skipped += 1
@@ -5899,6 +6603,804 @@ async def commit_discovered_programs(
         maps_inserted=maps_inserted,
         maps_skipped=maps_skipped,
         populate_gold_run_id=populate_gold_run_id,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Data domain discovery: closed vocab of semantic data needs + canonical map.
+#
+# Why this exists: the canonical-driven Sankey misled stakeholders. UCs were
+# tagged with `required_canonicals` like 'Snowflake' or 'Anaplan' which are
+# *implementation* names — the LLM picks them as plausible products for a
+# workload, not based on what BHE actually uses. The right abstraction is
+# the data NEED ("historical_market_prices", "outage_records") and source
+# systems are mapped to needs they satisfy. A 4-level Sankey (source →
+# domain → uc → dept) then shows the user a real conversation: "you need
+# outage_records to do X — these 3 BHE sources already provide that."
+#
+# Flow: discover (one ai_query produces vocab + canonical mappings) ->
+# commit (persist `data_domains` + `canonical_data_domain_map`).
+# ---------------------------------------------------------------------------
+
+_DATA_DOMAIN_TABLES_READY = False
+
+
+def _ensure_data_domain_tables() -> None:
+    """Idempotent CREATE TABLE IF NOT EXISTS for the 3 domain tables.
+
+    Bootstrap normally creates these via ``/setup/bootstrap-tables``, but
+    we also want existing deployments that ran an older bootstrap to
+    self-upgrade on first domain-discovery click. CREATE IF NOT EXISTS is
+    cheap and idempotent; the flag avoids re-issuing on every request.
+    """
+    global _DATA_DOMAIN_TABLES_READY
+    if _DATA_DOMAIN_TABLES_READY:
+        return
+    catalog = get_catalog()
+    gold = get_gold_schema()
+    for tbl in ("data_domains", "canonical_data_domain_map", "use_case_data_requirements"):
+        ddl_template = _SETUP_GOLD_DDL.get(tbl)
+        if not ddl_template:
+            continue
+        try:
+            execute_update(
+                ddl_template.format(fqn=f"{catalog}.{gold}.{tbl}"),
+                tag_overrides={"submodule": f"ensure_data_domain_{tbl}"},
+            )
+        except Exception as e:
+            logger.warning(f"_ensure_data_domain_tables: create {tbl} failed: {e}")
+            return
+    _DATA_DOMAIN_TABLES_READY = True
+
+
+_domain_preview_cache: dict[str, tuple[float, dict]] = {}
+_DOMAIN_PREVIEW_TTL_SEC = 10 * 60
+
+
+def _domain_preview_gc() -> None:
+    cutoff = time.time() - _DOMAIN_PREVIEW_TTL_SEC
+    stale = [k for k, (ts, _) in _domain_preview_cache.items() if ts < cutoff]
+    for k in stale:
+        _domain_preview_cache.pop(k, None)
+
+
+_DOMAIN_DISCOVERY_RESPONSE_SCHEMA = json.dumps({
+    "type": "json_schema",
+    "json_schema": {
+        "name": "domain_proposals",
+        "schema": {
+            "type": "object",
+            "properties": {
+                "domains": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name":        {"type": "string"},
+                            "label":       {"type": "string"},
+                            "description": {"type": "string"},
+                            "category":    {"type": "string"},
+                            "example_attributes": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                            },
+                        },
+                        "required": [
+                            "name", "label", "description", "category",
+                            "example_attributes",
+                        ],
+                        "additionalProperties": False,
+                    },
+                },
+                "canonical_mappings": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "canonical": {"type": "string"},
+                            "domain_names": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                            },
+                            "confidence": {
+                                "type": "string",
+                                "enum": ["high", "medium", "low"],
+                            },
+                        },
+                        "required": ["canonical", "domain_names", "confidence"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            "required": ["domains", "canonical_mappings"],
+            "additionalProperties": False,
+        },
+        "strict": True,
+    },
+})
+
+
+def _canonicals_for_domain_discovery() -> list[dict]:
+    """Active canonicals + their categories so the LLM has the right anchor."""
+    gold = get_gold_schema()
+    try:
+        rows = execute_query(
+            f"SELECT canonical, category, description "
+            f"FROM {fqn(gold, 'source_system_canonical')} "
+            f"WHERE COALESCE(is_active, true) = true "
+            f"ORDER BY category, canonical"
+        )
+        return rows or []
+    except Exception as e:
+        logger.warning(f"_canonicals_for_domain_discovery failed: {e}")
+        return []
+
+
+def _existing_uc_data_phrases(limit: int = 60) -> list[str]:
+    """A few `data_requirements` phrases from existing UCs to ground the
+    LLM's domain inventory in this customer's actual workload (so we don't
+    end up with a generic textbook taxonomy that doesn't match real UCs)."""
+    silver = get_silver_schema()
+    try:
+        rows = execute_query(
+            f"SELECT data_requirements, description FROM {fqn(silver, 'use_cases')} "
+            f"WHERE data_requirements IS NOT NULL "
+            f"LIMIT {int(limit)}"
+        )
+    except Exception:
+        return []
+    out: list[str] = []
+    for r in rows or []:
+        dr = r.get("data_requirements") or ""
+        try:
+            parsed = json.loads(dr) if isinstance(dr, str) else dr
+        except Exception:
+            parsed = []
+        if isinstance(parsed, list):
+            for x in parsed:
+                if isinstance(x, str) and x.strip():
+                    out.append(x.strip())
+    # de-dupe + cap
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for x in out:
+        k = x.lower()
+        if k in seen:
+            continue
+        seen.add(k)
+        deduped.append(x)
+        if len(deduped) >= limit:
+            break
+    return deduped
+
+
+def _build_domain_discovery_prompt(
+    *,
+    profile: dict,
+    canonicals: list[dict],
+    target_count: int,
+    uc_phrases: list[str],
+) -> str:
+    company = (profile.get("company_name") or "the company").strip()
+    industry = (profile.get("industry") or "").strip()
+    sub_industry = (profile.get("sub_industry") or "").strip()
+
+    canonical_lines = []
+    for c in canonicals:
+        n = (c.get("canonical") or "").strip()
+        if not n:
+            continue
+        cat = (c.get("category") or "").strip()
+        canonical_lines.append(f"  - {n}" + (f" (category={cat})" if cat else ""))
+    canonical_block = "\n".join(canonical_lines) or "  (none)"
+
+    phrase_block = ""
+    if uc_phrases:
+        phrase_block = (
+            "\nGROUNDING — phrases pulled from existing use case "
+            "`data_requirements`. The vocab MUST cover these needs:\n  - "
+            + "\n  - ".join(uc_phrases[:40])
+        )
+
+    return (
+        f"You are a data architect for {company}.\n"
+        f"Industry: {industry}{f' / {sub_industry}' if sub_industry else ''}.\n\n"
+        "TASK: Propose a closed vocabulary of DATA DOMAINS — semantic "
+        "data needs decoupled from specific products. Then map each known "
+        "BHE source-system canonical to the domains it serves.\n\n"
+        "Why we need this layer: the existing `required_canonicals` per "
+        "use case mixes data needs with implementation. We want UCs to say "
+        "'I need historical_market_prices' (a need) instead of 'I need "
+        "Snowflake' (a product). Source systems are then connected to the "
+        "needs they satisfy, so we can answer 'which BHE source provides "
+        "this need' and 'which needs are gaps'.\n\n"
+        "RULES for `domains`:\n"
+        f"- Produce roughly {target_count} domains (acceptable range: "
+        f"{max(15, target_count - 10)}..{target_count + 15}).\n"
+        "- Each domain must be IMPLEMENTATION-AGNOSTIC. Good examples: "
+        "`historical_market_prices`, `outage_records`, `meter_consumption_"
+        "reads`, `customer_billing_history`. Bad examples (these are "
+        "products, not needs): `snowflake_data`, `anaplan_models`, "
+        "`servicenow_tickets`.\n"
+        "- `name` is snake_case ASCII (≤ 50 chars).\n"
+        "- `label` is the display version (Title Case, ≤ 60 chars).\n"
+        "- `description` is one sentence (≤ 200 chars) describing what "
+        "data is in this domain at the entity level.\n"
+        "- `category` MUST be one of: trading, operations, customer, "
+        "asset, finance, risk, regulatory, external.\n"
+        "- `example_attributes` is 3-5 likely field names (not table "
+        "names). E.g. for `historical_market_prices`: ['price_at_hour', "
+        "'settlement_point', 'market_id'].\n\n"
+        "RULES for `canonical_mappings`:\n"
+        "- Produce ONE entry per canonical in the list below (skip none).\n"
+        "- `domain_names` MUST reference `name` keys you defined in "
+        "`domains`. List every domain this canonical typically serves "
+        "(can be 0..many; 0 is fine if the system doesn't host any of "
+        "these domains, e.g. internal tooling).\n"
+        "- `confidence` reflects how typical the mapping is.\n\n"
+        f"BHE SOURCE-SYSTEM CANONICALS:\n{canonical_block}\n"
+        f"{phrase_block}\n\n"
+        "Return a JSON object: "
+        "{\"domains\": [...], \"canonical_mappings\": [...]}"
+    )
+
+
+def _domain_id(name: str) -> str:
+    h = hashlib.sha1((name or "").strip().lower().encode("utf-8")).hexdigest()[:12]
+    return f"dom_{h}"
+
+
+@router.post(
+    "/domains/discover",
+    response_model=DomainsDiscoverOut,
+    operation_id="discoverDataDomains",
+)
+async def discover_data_domains(body: DomainsDiscoverIn) -> DomainsDiscoverOut:
+    """Dry-run: ask the LLM to propose the data-domain vocab AND the
+    canonical -> domain mappings in a single ai_query. Returns a preview
+    cached server-side; commit via ``/domains/discover/commit`` to persist.
+    """
+    _ensure_data_domain_tables()
+    _domain_preview_gc()
+
+    target_count = max(15, min(60, int(body.target_domain_count or 35)))
+
+    profile = _company_profile_dict()
+    canonicals = _canonicals_for_domain_discovery()
+    if not canonicals:
+        raise HTTPException(
+            422,
+            "No active canonical source systems found. Run "
+            "/api/jobs/normalize-sources/run first so the discovery has a "
+            "real list of BHE systems to map.",
+        )
+
+    uc_phrases = _existing_uc_data_phrases() if body.include_existing_uc_text else []
+
+    prompt = _build_domain_discovery_prompt(
+        profile=profile,
+        canonicals=canonicals,
+        target_count=target_count,
+        uc_phrases=uc_phrases,
+    )
+
+    try:
+        # Domain discovery is a denser response (~target_count*200 tokens
+        # for vocab + canonicals*50 for mappings); the default 4000 max
+        # tokens in _ai_query is borderline. We override here to be safe.
+        sql = f"""
+            SELECT ai_query(
+                '{LLM_ENDPOINT}',
+                '{_sql_escape(prompt)}',
+                responseFormat => '{_sql_escape(_DOMAIN_DISCOVERY_RESPONSE_SCHEMA)}',
+                modelParameters => named_struct('max_tokens', 9000, 'temperature', 0.3)
+            ) AS result
+        """
+        rows = execute_query(sql)
+        raw = rows[0]["result"] if rows else ""
+    except Exception as e:
+        logger.exception("discover_data_domains: ai_query failed")
+        raise HTTPException(502, f"LLM domain discovery failed: {e}")
+
+    try:
+        parsed = json.loads(raw) if raw else {}
+    except Exception as e:
+        logger.warning(f"discover_data_domains: parse failed: {e!r} raw={raw[:300]!r}")
+        parsed = {}
+
+    raw_domains = parsed.get("domains", []) if isinstance(parsed, dict) else []
+    raw_mappings = parsed.get("canonical_mappings", []) if isinstance(parsed, dict) else []
+
+    valid_categories = {
+        "trading", "operations", "customer", "asset",
+        "finance", "risk", "regulatory", "external",
+    }
+
+    domains: list[DomainProposal] = []
+    seen_names: set[str] = set()
+    for it in raw_domains:
+        if not isinstance(it, dict):
+            continue
+        name = (it.get("name") or "").strip().lower()
+        # Normalize to safe snake_case (LLM occasionally returns spaces).
+        name = "".join(
+            ch if ch.isalnum() or ch == "_" else "_" for ch in name
+        ).strip("_")
+        if not name or name in seen_names or len(name) > 50:
+            continue
+        seen_names.add(name)
+        cat = (it.get("category") or "").strip().lower()
+        if cat not in valid_categories:
+            cat = "operations"  # safe default; we accept rather than reject
+        ex_attrs = it.get("example_attributes") or []
+        if not isinstance(ex_attrs, list):
+            ex_attrs = []
+        domains.append(DomainProposal(
+            proposal_id=_domain_id(name),
+            name=name,
+            label=str(it.get("label") or name.replace("_", " ").title()).strip()[:60],
+            description=str(it.get("description") or "").strip()[:300],
+            category=cat,
+            example_attributes=[str(x).strip() for x in ex_attrs if x][:8],
+        ))
+
+    if not domains:
+        raise HTTPException(
+            502,
+            "LLM returned no usable domain proposals. Try increasing "
+            "target_domain_count or rerun.",
+        )
+
+    # Filter mappings to only domains we actually accepted, and to canonicals
+    # that exist (LLM occasionally invents).
+    valid_canonicals = {(c.get("canonical") or "").strip() for c in canonicals}
+    mappings: list[DomainCanonicalMapping] = []
+    seen_canon: set[str] = set()
+    for it in raw_mappings:
+        if not isinstance(it, dict):
+            continue
+        canon = (it.get("canonical") or "").strip()
+        if not canon or canon not in valid_canonicals or canon in seen_canon:
+            continue
+        seen_canon.add(canon)
+        domain_names_raw = it.get("domain_names") or []
+        if not isinstance(domain_names_raw, list):
+            domain_names_raw = []
+        accepted_dn = [
+            (str(n).strip().lower()) for n in domain_names_raw
+            if isinstance(n, str) and str(n).strip().lower() in seen_names
+        ]
+        conf = (it.get("confidence") or "medium").lower()
+        if conf not in {"high", "medium", "low"}:
+            conf = "medium"
+        mappings.append(DomainCanonicalMapping(
+            canonical=canon,
+            domain_names=accepted_dn,
+            confidence=conf,
+        ))
+
+    preview_id = f"domprev_{uuid.uuid4().hex[:14]}"
+    expires_at = datetime.utcfromtimestamp(time.time() + _DOMAIN_PREVIEW_TTL_SEC).isoformat() + "Z"
+    out = DomainsDiscoverOut(
+        preview_id=preview_id,
+        domains=sorted(domains, key=lambda d: (d.category, d.name)),
+        canonical_mappings=mappings,
+        company_name=str(profile.get("company_name") or ""),
+        canonicals_considered=[c.get("canonical") or "" for c in canonicals],
+        expires_at=expires_at,
+    )
+    _domain_preview_cache[preview_id] = (time.time(), out.model_dump())
+    return out
+
+
+@router.post(
+    "/domains/discover/commit",
+    response_model=DomainsDiscoverCommitOut,
+    operation_id="commitDiscoveredDataDomains",
+)
+async def commit_discovered_data_domains(
+    body: DomainsDiscoverCommitIn,
+) -> DomainsDiscoverCommitOut:
+    """Persist selected domain proposals AND their canonical mappings.
+
+    Idempotent on (data_domains.name) and (canonical, domain_name). The
+    inline-fallback pattern from program discovery is reused: a multi-
+    worker uvicorn deploy can drop the in-process cache between discover
+    and commit, so the client also sends `domains` + `canonical_mappings`
+    back as belt-and-suspenders.
+    """
+    _ensure_data_domain_tables()
+    _domain_preview_gc()
+
+    cached = _domain_preview_cache.get(body.preview_id)
+    domains_raw: list[dict] = []
+    mappings_raw: list[dict] = []
+    if cached:
+        _, payload = cached
+        domains_raw = payload.get("domains") or []
+        mappings_raw = payload.get("canonical_mappings") or []
+    elif body.domains is not None:
+        domains_raw = [d.model_dump() for d in (body.domains or [])]
+        mappings_raw = [m.model_dump() for m in (body.canonical_mappings or [])]
+    else:
+        raise HTTPException(
+            410,
+            "Preview not found in server cache and no inline domains were "
+            "provided. Re-run /domains/discover, or include `domains` and "
+            "`canonical_mappings` in the commit body.",
+        )
+
+    selected_ids = set(body.selected_domain_ids or [])
+    if selected_ids:
+        domains_raw = [d for d in domains_raw if d.get("proposal_id") in selected_ids]
+
+    accepted_names: set[str] = {(d.get("name") or "").strip() for d in domains_raw if d.get("name")}
+
+    gold = get_gold_schema()
+    domains_inserted = 0
+    domains_skipped = 0
+    canonical_maps_inserted = 0
+    canonical_maps_skipped = 0
+
+    for d in domains_raw:
+        name = (d.get("name") or "").strip()
+        if not name:
+            domains_skipped += 1
+            continue
+        try:
+            existing = execute_query(
+                f"SELECT name FROM {fqn(gold, 'data_domains')} "
+                f"WHERE LOWER(name) = LOWER('{_sql_escape(name)}') LIMIT 1"
+            )
+            if existing:
+                domains_skipped += 1
+                continue
+            ex_attrs = d.get("example_attributes") or []
+            if isinstance(ex_attrs, list):
+                ex_str = ", ".join(str(x) for x in ex_attrs if x)
+            else:
+                ex_str = str(ex_attrs)
+            execute_query(f"""
+                INSERT INTO {fqn(gold, 'data_domains')}
+                    (domain_id, name, label, description, category,
+                     example_attributes, is_active, is_user_edited,
+                     created_at, updated_at)
+                VALUES (
+                    '{_sql_escape(_domain_id(name))}',
+                    '{_sql_escape(name)}',
+                    '{_sql_escape(d.get('label') or name)}',
+                    '{_sql_escape(d.get('description') or '')}',
+                    '{_sql_escape(d.get('category') or 'operations')}',
+                    '{_sql_escape(ex_str)}',
+                    true,
+                    false,
+                    current_timestamp(),
+                    current_timestamp()
+                )
+            """)
+            domains_inserted += 1
+        except Exception as e:
+            logger.warning(f"commit data_domain insert {name!r} failed: {e}")
+            domains_skipped += 1
+
+    for m in mappings_raw:
+        canonical = (m.get("canonical") or "").strip()
+        domain_names = m.get("domain_names") or []
+        if not canonical or not isinstance(domain_names, list):
+            canonical_maps_skipped += 1
+            continue
+        confidence = (m.get("confidence") or "medium").lower()
+        for dn in domain_names:
+            dn_clean = (dn or "").strip().lower()
+            if not dn_clean or dn_clean not in accepted_names:
+                canonical_maps_skipped += 1
+                continue
+            try:
+                existing = execute_query(
+                    f"SELECT canonical FROM {fqn(gold, 'canonical_data_domain_map')} "
+                    f"WHERE LOWER(canonical) = LOWER('{_sql_escape(canonical)}') "
+                    f"  AND LOWER(domain_name) = LOWER('{_sql_escape(dn_clean)}') "
+                    f"LIMIT 1"
+                )
+                if existing:
+                    canonical_maps_skipped += 1
+                    continue
+                execute_query(f"""
+                    INSERT INTO {fqn(gold, 'canonical_data_domain_map')}
+                        (canonical, domain_name, confidence, notes,
+                         is_user_edited, mapped_at, updated_at)
+                    VALUES (
+                        '{_sql_escape(canonical)}',
+                        '{_sql_escape(dn_clean)}',
+                        '{_sql_escape(confidence)}',
+                        'Created by domain discovery',
+                        false,
+                        current_timestamp(),
+                        current_timestamp()
+                    )
+                """)
+                canonical_maps_inserted += 1
+            except Exception as e:
+                logger.warning(
+                    f"commit canonical_data_domain_map ({canonical!r}, "
+                    f"{dn_clean!r}) failed: {e}"
+                )
+                canonical_maps_skipped += 1
+
+    _domain_preview_cache.pop(body.preview_id, None)
+
+    return DomainsDiscoverCommitOut(
+        domains_inserted=domains_inserted,
+        domains_skipped=domains_skipped,
+        canonical_maps_inserted=canonical_maps_inserted,
+        canonical_maps_skipped=canonical_maps_skipped,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Use-case data-domain extraction (Phase 2 backfill).
+#
+# UCs created before Phase 2 — including the 23 from the BHE Pacific seed
+# — have empty `required_data_domains`. This endpoint runs one ai_query
+# over them and writes both the silver column and the
+# gold.use_case_data_requirements rows. Idempotent: only touches UCs whose
+# required_data_domains is empty, unless `overwrite=true`.
+# ---------------------------------------------------------------------------
+
+
+_UC_EXTRACT_DOMAINS_RESPONSE_SCHEMA = json.dumps({
+    "type": "json_schema",
+    "json_schema": {
+        "name": "uc_domain_extraction",
+        "schema": {
+            "type": "object",
+            "properties": {
+                "use_cases": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "use_case_id": {"type": "string"},
+                            "required_data_domains": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                            },
+                        },
+                        "required": ["use_case_id", "required_data_domains"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            "required": ["use_cases"],
+            "additionalProperties": False,
+        },
+        "strict": True,
+    },
+})
+
+
+@router.post(
+    "/use-cases/extract-data-domains",
+    response_model=UseCasesExtractDomainsOut,
+    operation_id="extractUseCaseDataDomains",
+)
+async def extract_use_case_data_domains(
+    body: UseCasesExtractDomainsIn,
+) -> UseCasesExtractDomainsOut:
+    """Backfill `required_data_domains` for existing UCs in one ai_query.
+
+    For each UC missing its data-domain tag (or all UCs when
+    overwrite=true), feed name+description+data_requirements to the LLM
+    along with the closed `data_domains` vocab and ask it to pick the
+    needed domains. Writes both silver.use_cases.required_data_domains and
+    gold.use_case_data_requirements rows.
+    """
+    _ensure_use_case_status_columns()
+    _ensure_data_domain_tables()
+
+    silver = get_silver_schema()
+    gold = get_gold_schema()
+
+    domains_vocab = _load_data_domains_vocab()
+    if not domains_vocab:
+        raise HTTPException(
+            422,
+            "No data domains in the vocab yet. Run /api/domains/discover "
+            "and commit first.",
+        )
+    valid_names = {(d.get("name") or "").strip() for d in domains_vocab if d.get("name")}
+
+    # Load candidate UCs.
+    where = "1=1"
+    if not body.overwrite:
+        # Empty json string ('[]') OR NULL → not yet tagged.
+        where = (
+            "(required_data_domains IS NULL OR "
+            "TRIM(required_data_domains) = '' OR "
+            "TRIM(required_data_domains) = '[]')"
+        )
+    try:
+        rows = execute_query(
+            f"SELECT id, use_case_name, description, business_value, "
+            f"       value_rationale, data_requirements "
+            f"FROM {fqn(silver, 'use_cases')} "
+            f"WHERE {where}"
+        )
+    except Exception as e:
+        raise HTTPException(500, f"Could not load use cases: {e}")
+
+    if not rows:
+        return UseCasesExtractDomainsOut(
+            use_cases_processed=0,
+            use_cases_updated=0,
+            requirements_inserted=0,
+            requirements_skipped=0,
+        )
+
+    # Build the prompt — one shot for ALL UCs (ai_query handles long
+    # prompts fine, and we want a single transaction's worth of work).
+    domain_lines = []
+    for d in domains_vocab:
+        n = (d.get("name") or "").strip()
+        lbl = (d.get("label") or "").strip()
+        desc = (d.get("description") or "").strip()
+        domain_lines.append(f"  - `{n}` — {lbl}: {desc}")
+    domain_block = "\n".join(domain_lines)
+
+    uc_lines = []
+    for r in rows:
+        uc_id = (r.get("id") or "").strip()
+        if not uc_id:
+            continue
+        name = (r.get("use_case_name") or "").strip()
+        desc = (r.get("description") or "").strip()
+        bv = (r.get("business_value") or "").strip()
+        dr = r.get("data_requirements") or ""
+        try:
+            dr_parsed = json.loads(dr) if isinstance(dr, str) else (dr or [])
+        except Exception:
+            dr_parsed = []
+        dr_str = "; ".join(str(x) for x in dr_parsed if x)[:400]
+        uc_lines.append(
+            f"- id={uc_id}\n"
+            f"  name: {name}\n"
+            f"  description: {desc[:400]}\n"
+            f"  business_value: {bv[:240]}\n"
+            f"  data_requirements: {dr_str}"
+        )
+    uc_block = "\n".join(uc_lines)
+
+    prompt = (
+        "You are tagging existing use cases with the data domains they "
+        "require. For each use case below, pick the data-domain `name` "
+        "keys (exact match required) from the closed vocabulary that the "
+        "use case needs to operate. Return 1-6 domains per use case; "
+        "return [] only when no domain in the vocab fits.\n\n"
+        f"DATA DOMAINS (closed vocab):\n{domain_block}\n\n"
+        f"USE CASES:\n{uc_block}\n\n"
+        "Return JSON: {\"use_cases\":[{\"use_case_id\":\"...\","
+        "\"required_data_domains\":[...]}, ...]}"
+    )
+
+    try:
+        sql = f"""
+            SELECT ai_query(
+                '{LLM_ENDPOINT}',
+                '{_sql_escape(prompt)}',
+                responseFormat => '{_sql_escape(_UC_EXTRACT_DOMAINS_RESPONSE_SCHEMA)}',
+                modelParameters => named_struct('max_tokens', 9000, 'temperature', 0.2)
+            ) AS result
+        """
+        ai_rows = execute_query(sql)
+        raw = ai_rows[0]["result"] if ai_rows else ""
+    except Exception as e:
+        logger.exception("extract_use_case_data_domains: ai_query failed")
+        raise HTTPException(502, f"LLM extraction failed: {e}")
+
+    try:
+        parsed = json.loads(raw) if raw else {}
+    except Exception as e:
+        logger.warning(f"extract: parse failed: {e!r} raw={raw[:300]!r}")
+        parsed = {}
+
+    items = parsed.get("use_cases", []) if isinstance(parsed, dict) else []
+    if not isinstance(items, list):
+        items = []
+
+    by_id: dict[str, list[str]] = {}
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        uc_id = (it.get("use_case_id") or "").strip()
+        if not uc_id:
+            continue
+        domains_raw = it.get("required_data_domains") or []
+        if not isinstance(domains_raw, list):
+            continue
+        kept = [
+            (str(d).strip().lower())
+            for d in domains_raw
+            if isinstance(d, str) and str(d).strip().lower() in valid_names
+        ]
+        # de-dupe in-list
+        seen: set[str] = set()
+        deduped: list[str] = []
+        for d in kept:
+            if d not in seen:
+                seen.add(d)
+                deduped.append(d)
+        by_id[uc_id] = deduped
+
+    use_cases_updated = 0
+    requirements_inserted = 0
+    requirements_skipped = 0
+
+    for r in rows:
+        uc_id = (r.get("id") or "").strip()
+        if not uc_id:
+            continue
+        domains = by_id.get(uc_id, [])
+        rdd_json = json.dumps(domains)
+        try:
+            execute_query(
+                f"UPDATE {fqn(silver, 'use_cases')} "
+                f"SET required_data_domains = '{_sql_escape(rdd_json)}', "
+                f"    is_user_edited = true "
+                f"WHERE id = '{_sql_escape(uc_id)}'"
+            )
+            use_cases_updated += 1
+        except Exception as e:
+            logger.warning(f"extract: update silver for {uc_id!r} failed: {e}")
+            continue
+
+        if body.overwrite:
+            try:
+                execute_query(
+                    f"DELETE FROM {fqn(gold, 'use_case_data_requirements')} "
+                    f"WHERE use_case_id = '{_sql_escape(uc_id)}' "
+                    f"  AND COALESCE(is_user_edited, false) = false"
+                )
+            except Exception as e:
+                logger.warning(f"extract: pre-delete reqs for {uc_id!r} failed: {e}")
+
+        for dn in domains:
+            try:
+                existing = execute_query(
+                    f"SELECT use_case_id FROM "
+                    f"{fqn(gold, 'use_case_data_requirements')} "
+                    f"WHERE use_case_id = '{_sql_escape(uc_id)}' "
+                    f"  AND LOWER(data_domain) = LOWER('{_sql_escape(dn)}') "
+                    f"LIMIT 1"
+                )
+                if existing:
+                    requirements_skipped += 1
+                    continue
+                execute_query(f"""
+                    INSERT INTO {fqn(gold, 'use_case_data_requirements')}
+                        (use_case_id, data_domain, necessity, rationale,
+                         mapped_by, is_user_edited, mapped_at)
+                    VALUES (
+                        '{_sql_escape(uc_id)}',
+                        '{_sql_escape(dn)}',
+                        'must_have',
+                        'Extracted by extract-data-domains job',
+                        'extraction',
+                        false,
+                        current_timestamp()
+                    )
+                """)
+                requirements_inserted += 1
+            except Exception as e:
+                logger.warning(
+                    f"extract: insert req ({uc_id!r}, {dn!r}) failed: {e}"
+                )
+                requirements_skipped += 1
+
+    return UseCasesExtractDomainsOut(
+        use_cases_processed=len(rows),
+        use_cases_updated=use_cases_updated,
+        requirements_inserted=requirements_inserted,
+        requirements_skipped=requirements_skipped,
     )
 
 

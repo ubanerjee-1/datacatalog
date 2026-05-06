@@ -245,10 +245,14 @@ for tbl, ddl in [
     #   3. Generation lens (PR 2 of UC redesign — `/use-cases` page):
     #      affiliate, lens, time_horizon, value_type, is_regulatory,
     #      required_canonicals, generated_at, generated_by.
-    # All three are baked into bootstrap so a fresh deploy never has to run
+    #   4. Data-domain layer (semantic data needs):
+    #      required_data_domains. Drives the 4-level Value & Readiness
+    #      Sankey (source -> domain -> uc -> dept). Empty until
+    #      `/api/use-cases/extract-data-domains` runs for older rows.
+    # All four are baked into bootstrap so a fresh deploy never has to run
     # `_ensure_use_case_status_columns()`'s defensive ALTER. The helper only
     # exists for already-deployed environments (e.g. UB_TEST) that pre-date
-    # PR 2 and need to catch up in place.
+    # later phases and need to catch up in place.
     ("use_cases", """CREATE TABLE IF NOT EXISTS {fqn} (
         id STRING, use_case_name STRING, description STRING,
         department STRING, category STRING, business_value STRING,
@@ -264,7 +268,8 @@ for tbl, ddl in [
         time_horizon STRING COMMENT 'quick_win|strategic|NULL',
         value_type STRING COMMENT 'cost|revenue|risk|mixed|NULL',
         is_regulatory BOOLEAN,
-        required_canonicals STRING COMMENT 'JSON array of canonical source names',
+        required_canonicals STRING COMMENT 'JSON array of canonical source names (legacy; superseded by required_data_domains)',
+        required_data_domains STRING COMMENT 'JSON array of data_domains.name (semantic data needs)',
         generated_at TIMESTAMP,
         generated_by STRING COMMENT 'llm endpoint id, or "chat" for free-form'
     ) USING DELTA"""),

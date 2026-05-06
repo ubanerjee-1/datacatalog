@@ -428,7 +428,7 @@ const GOLD_TABLES: TableSpec[] = [
   {
     name: "use_case_source_requirements",
     purpose:
-      "Many-to-many: use cases <-> required canonical sources. Necessity is must_have | nice_to_have. The data_need_excerpt records which line of use_cases.data_requirements drove each link, for traceability.",
+      "(LEGACY) Many-to-many: use cases <-> required canonical sources. Superseded by use_case_data_requirements + canonical_data_domain_map for the value Sankey, but still populated by build_value_model and consumed by /value/sankey?levels=3 fallback when the data-domain layer isn't seeded.",
     columns: [
       "use_case_id",
       "required_canonical",
@@ -440,11 +440,69 @@ const GOLD_TABLES: TableSpec[] = [
     ],
     writtenBy: ["build_value_model.py (apply_llm_mapping stage)"],
     readBy: [
-      "Value & Readiness (all tabs)",
+      "Value & Readiness (3-level fallback Sankey)",
       "/api/value/summary",
       "/api/value/source-rollup",
-      "/api/value/sankey",
+      "/api/value/sankey?levels=3",
     ],
+    manualEdit: true,
+    llmDerived: true,
+  },
+  {
+    name: "data_domains",
+    purpose:
+      "Closed vocabulary of *semantic data needs* (e.g. historical_market_prices, outage_records) — implementation-agnostic, decoupled from specific products. Drives the 4-level Value & Readiness Sankey (source -> domain -> uc -> dept). Built one-shot via /api/domains/discover.",
+    columns: [
+      "domain_id",
+      "name",
+      "label",
+      "description",
+      "category",
+      "example_attributes",
+      "is_active",
+      "is_user_edited",
+    ],
+    writtenBy: ["/api/domains/discover/commit (one ai_query)"],
+    readBy: [
+      "Use case generation prompt (closed vocab)",
+      "/api/value/sankey (4-level)",
+    ],
+    manualEdit: true,
+    llmDerived: true,
+  },
+  {
+    name: "canonical_data_domain_map",
+    purpose:
+      "Many-to-many bridge: source-system canonicals -> data domains they typically serve. Powers the source -> domain edges of the 4-level Sankey (replacing the implicit canonical->UC link from the legacy 3-level path).",
+    columns: [
+      "canonical",
+      "domain_name",
+      "confidence",
+      "notes",
+      "is_user_edited",
+    ],
+    writtenBy: ["/api/domains/discover/commit (same ai_query as data_domains)"],
+    readBy: ["/api/value/sankey (4-level)"],
+    manualEdit: true,
+    llmDerived: true,
+  },
+  {
+    name: "use_case_data_requirements",
+    purpose:
+      "Many-to-many: use cases <-> required data domains. Replaces use_case_source_requirements for the new Sankey: a UC says 'I need outage_records' (a need), not 'I need ServiceNow' (a product). Necessity is must_have | nice_to_have.",
+    columns: [
+      "use_case_id",
+      "data_domain",
+      "necessity",
+      "rationale",
+      "mapped_by",
+      "is_user_edited",
+    ],
+    writtenBy: [
+      "/api/use-cases/generate/commit (writes alongside silver.use_cases)",
+      "/api/use-cases/extract-data-domains (backfill for older UCs)",
+    ],
+    readBy: ["/api/value/sankey (4-level)"],
     manualEdit: true,
     llmDerived: true,
   },

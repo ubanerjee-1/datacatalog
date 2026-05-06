@@ -508,6 +508,7 @@ export interface UseCaseCandidate {
   is_regulatory: boolean;
   data_requirements: string[];
   required_canonicals: string[];
+  required_data_domains: string[];
 }
 
 export interface UseCaseGenerateOut {
@@ -617,6 +618,87 @@ export async function fetchEntities(params?: {
   matched_only?: boolean;
 }) {
   const { data } = await api.get("/company/entities", { params });
+  return data;
+}
+
+// --- Data domain discovery (semantic data needs vocab + canonical map) ---
+//
+// Phase 1+2 of the domain-layer rollout. /api/domains/discover proposes
+// the vocab AND the canonical->domain mappings in one ai_query;
+// /commit persists. /api/use-cases/extract-data-domains backfills
+// `required_data_domains` for UCs that pre-date the vocab.
+
+export interface DomainProposal {
+  proposal_id: string;
+  name: string;
+  label: string;
+  description: string;
+  category: string;
+  example_attributes: string[];
+}
+
+export interface DomainCanonicalMapping {
+  canonical: string;
+  domain_names: string[];
+  confidence: string;
+}
+
+export interface DomainsDiscoverOut {
+  preview_id: string;
+  domains: DomainProposal[];
+  canonical_mappings: DomainCanonicalMapping[];
+  company_name: string;
+  canonicals_considered: string[];
+  expires_at: string | null;
+}
+
+export interface DomainsDiscoverCommitOut {
+  domains_inserted: number;
+  domains_skipped: number;
+  canonical_maps_inserted: number;
+  canonical_maps_skipped: number;
+}
+
+export async function discoverDataDomains(
+  body: { target_domain_count?: number; include_existing_uc_text?: boolean } = {},
+): Promise<DomainsDiscoverOut> {
+  const { data } = await api.post("/domains/discover", {
+    target_domain_count: body.target_domain_count ?? 35,
+    include_existing_uc_text: body.include_existing_uc_text ?? true,
+  });
+  return data;
+}
+
+export async function commitDiscoveredDataDomains(args: {
+  preview_id: string;
+  selected_domain_ids?: string[];
+  // Inline fallback for multi-worker uvicorn deploys; mirrors the
+  // program-discovery pattern.
+  domains?: DomainProposal[];
+  canonical_mappings?: DomainCanonicalMapping[];
+}): Promise<DomainsDiscoverCommitOut> {
+  const { data } = await api.post("/domains/discover/commit", {
+    preview_id: args.preview_id,
+    selected_domain_ids: args.selected_domain_ids ?? [],
+    domains: args.domains,
+    canonical_mappings: args.canonical_mappings,
+  });
+  return data;
+}
+
+export interface UseCasesExtractDomainsOut {
+  use_cases_processed: number;
+  use_cases_updated: number;
+  requirements_inserted: number;
+  requirements_skipped: number;
+}
+
+export async function extractUseCaseDataDomains(
+  body: { overwrite?: boolean } = {},
+): Promise<UseCasesExtractDomainsOut> {
+  const { data } = await api.post("/use-cases/extract-data-domains", {
+    overwrite: body.overwrite ?? false,
+  });
   return data;
 }
 

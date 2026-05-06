@@ -219,6 +219,10 @@ class UseCaseOut(BaseModel):
     value_type: Optional[str] = None
     is_regulatory: Optional[bool] = None
     required_canonicals: list[str] = Field(default_factory=list)
+    # Data-domain layer (Phase 2): semantic data needs decoupled from
+    # specific source-system products. Older UCs may have empty list
+    # until the extraction job has been run.
+    required_data_domains: list[str] = Field(default_factory=list)
 
 
 class UseCaseUpdateIn(BaseModel):
@@ -311,6 +315,10 @@ class UseCaseCandidate(BaseModel):
     is_regulatory: bool = False
     data_requirements: list[str] = Field(default_factory=list)
     required_canonicals: list[str] = Field(default_factory=list)
+    # New (Phase 2): semantic data needs from the closed `data_domains` vocab.
+    # Generation now produces these directly when the vocab is populated;
+    # the legacy `required_canonicals` is kept for back-compat until cleanup.
+    required_data_domains: list[str] = Field(default_factory=list)
 
 
 class UseCaseGenerateOut(BaseModel):
@@ -410,6 +418,89 @@ class ProgramsDiscoverCommitOut(BaseModel):
     maps_inserted: int
     maps_skipped: int
     populate_gold_run_id: Optional[str] = None
+
+
+# --- Data domain discovery (semantic data needs vocab + canonical mapping) ---
+# Closes a misleading-Sankey problem: the `required_canonicals` column in
+# silver.use_cases / gold.use_case_source_requirements names *specific
+# products* (Snowflake, Anaplan, ServiceNow) that the LLM picks as plausible
+# implementations for a workload — but we have no evidence BHE uses those
+# specifically. The right abstraction is the data NEED ("historical_market_
+# prices", "outage_records") and source systems are mapped to needs they
+# satisfy. This flow LLM-derives both sides in one call: a closed vocab of
+# data domains, plus per-canonical mappings showing which BHE source systems
+# serve which domains.
+
+class DomainCanonicalMapping(BaseModel):
+    """Per-canonical list of data domains it serves."""
+    canonical: str
+    domain_names: list[str] = Field(default_factory=list)
+    confidence: str = "medium"  # high | medium | low
+
+
+class DomainProposal(BaseModel):
+    """A single proposed data-need entry in the closed vocab."""
+    proposal_id: str  # stable hash of name; idempotent across runs
+    name: str  # snake_case key, e.g. 'historical_market_prices'
+    label: str  # display, e.g. 'Historical Market Prices'
+    description: str
+    category: str  # trading | operations | customer | asset | finance | risk | regulatory | external
+    example_attributes: list[str] = Field(default_factory=list)
+
+
+class DomainsDiscoverIn(BaseModel):
+    """Request body for ``POST /api/domains/discover`` (dry-run preview)."""
+    target_domain_count: int = 35  # 20..60; suggested vocab size
+    include_existing_uc_text: bool = True  # use silver.use_cases descriptions as grounding
+
+
+class DomainsDiscoverOut(BaseModel):
+    """Preview response. ``preview_id`` is short-lived (~10 minutes)."""
+    preview_id: str
+    domains: list[DomainProposal]
+    canonical_mappings: list[DomainCanonicalMapping] = Field(default_factory=list)
+    company_name: str = ""
+    canonicals_considered: list[str] = Field(default_factory=list)
+    expires_at: Optional[str] = None
+
+
+class DomainsDiscoverCommitIn(BaseModel):
+    """Persist domain vocab + canonical mappings.
+
+    Domains and mappings are committed together (the LLM produced them in one
+    pass and they reference each other); selecting a subset of domains will
+    automatically filter the canonical mappings to only those domains.
+    """
+    preview_id: str
+    selected_domain_ids: list[str] = Field(default_factory=list)
+    # Inline fallback, mirroring the program-discovery cache-robustness fix:
+    # when uvicorn --workers > 1 splits discover and commit across processes,
+    # the in-process cache misses; the client should always send these back.
+    domains: Optional[list[DomainProposal]] = None
+    canonical_mappings: Optional[list[DomainCanonicalMapping]] = None
+
+
+class DomainsDiscoverCommitOut(BaseModel):
+    domains_inserted: int
+    domains_skipped: int
+    canonical_maps_inserted: int
+    canonical_maps_skipped: int
+
+
+# --- Use-case data-domain extraction (Phase 2: re-tag existing UCs) ---
+
+class UseCasesExtractDomainsIn(BaseModel):
+    """Re-prompt the LLM to extract required data_domains for UCs that
+    don't yet have them. Idempotent: skips UCs whose
+    `required_data_domains` is already populated."""
+    overwrite: bool = False  # if true, re-extract even when already set
+
+
+class UseCasesExtractDomainsOut(BaseModel):
+    use_cases_processed: int
+    use_cases_updated: int
+    requirements_inserted: int
+    requirements_skipped: int
 
 
 # --- Edit Center: bhe_gold dimension tables ---

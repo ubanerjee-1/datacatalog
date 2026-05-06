@@ -11,8 +11,14 @@ import {
   commitGeneratedUseCases,
   discoverPrograms,
   commitDiscoveredPrograms,
+  discoverDataDomains,
+  commitDiscoveredDataDomains,
+  extractUseCaseDataDomains,
   USE_CASE_STATUS_LABEL,
   USE_CASE_STATUS_ORDER,
+  type DomainProposal,
+  type DomainCanonicalMapping,
+  type DomainsDiscoverOut,
   type ProgramDiscoveryProposal,
   type ProgramsDiscoverOut,
   type UseCaseCandidate,
@@ -40,12 +46,14 @@ import {
   ChevronRight,
   Clock,
   DollarSign,
+  Layers,
   Lightbulb,
   Loader2,
   Map as MapIcon,
   Search,
   ShieldAlert,
   Sparkles,
+  Tags,
   Trash2,
   X,
 } from "lucide-react";
@@ -94,6 +102,10 @@ type UseCase = {
   value_type?: "cost" | "revenue" | "risk" | "mixed" | null;
   is_regulatory?: boolean | null;
   required_canonicals?: string[] | null;
+  // Phase 2 of the data-domain layer: semantic data needs the UC requires.
+  // Empty/null on UCs created before /api/use-cases/extract-data-domains
+  // has been run for them.
+  required_data_domains?: string[] | null;
 };
 
 const STATUS_BADGE: Record<
@@ -182,6 +194,22 @@ function UseCasesPage() {
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [generateOpen, setGenerateOpen] = useState(false);
   const [discoveryOpen, setDiscoveryOpen] = useState(false);
+  const [domainOpen, setDomainOpen] = useState(false);
+
+  const extractDomainsMutation = useMutation({
+    mutationFn: () => extractUseCaseDataDomains({ overwrite: false }),
+    onSuccess: (res) => {
+      toast.success(
+        `Tagged ${res.use_cases_updated} use case${res.use_cases_updated === 1 ? "" : "s"} ` +
+          `(${res.requirements_inserted} domain requirement${res.requirements_inserted === 1 ? "" : "s"} added)`,
+      );
+      queryClient.invalidateQueries({ queryKey: ["useCases"] });
+    },
+    onError: (err: any) => {
+      const detail = err?.response?.data?.detail || err?.message || String(err);
+      toast.error(`Tag UCs failed: ${detail}`);
+    },
+  });
 
   const { data: useCases, isLoading } = useQuery({
     queryKey: ["useCases"],
@@ -308,6 +336,29 @@ function UseCasesPage() {
             <MapIcon className="h-4 w-4 mr-2" />
             Map programs
           </Button>
+          <Button
+            size="lg"
+            variant="outline"
+            onClick={() => setDomainOpen(true)}
+            title="Build the data-domain vocabulary (semantic data needs) and map BHE source canonicals to the domains they serve. Powers the 4-level Sankey on Value & Readiness."
+          >
+            <Layers className="h-4 w-4 mr-2" />
+            Map data domains
+          </Button>
+          <Button
+            size="lg"
+            variant="outline"
+            disabled={extractDomainsMutation.isPending}
+            onClick={() => extractDomainsMutation.mutate()}
+            title="Tag existing use cases with their required data domains. Idempotent: only touches UCs that aren't already tagged."
+          >
+            {extractDomainsMutation.isPending ? (
+              <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+            ) : (
+              <Tags className="h-4 w-4 mr-2" />
+            )}
+            Tag UCs with domains
+          </Button>
           <Button size="lg" onClick={() => setGenerateOpen(true)}>
             <Sparkles className="h-4 w-4 mr-2" />
             Generate Use Cases
@@ -340,6 +391,16 @@ function UseCasesPage() {
             // mapping so anything reactive picks up the new state.
             queryClient.invalidateQueries({ queryKey: ["editAffiliates"] });
             setDiscoveryOpen(false);
+          }}
+        />
+      )}
+
+      {domainOpen && (
+        <DomainDiscoveryDialog
+          onClose={() => setDomainOpen(false)}
+          onCommitted={() => {
+            queryClient.invalidateQueries({ queryKey: ["useCases"] });
+            setDomainOpen(false);
           }}
         />
       )}
@@ -689,6 +750,30 @@ function UseCaseRow({
                       }`}
                     >
                       {c}
+                    </Badge>
+                  ))}
+                </div>
+              </div>
+            );
+          })()}
+          {(() => {
+            // Data domains (Phase 2). Surface separately from canonicals so
+            // it's clear these are *needs* (semantic) not *products*.
+            const doms = asStringArray(uc.required_data_domains);
+            if (doms.length === 0) return null;
+            return (
+              <div>
+                <span className="text-xs text-muted-foreground uppercase tracking-wide">
+                  Data domains (needs)
+                </span>
+                <div className="flex flex-wrap gap-1 mt-1">
+                  {doms.map((d, i) => (
+                    <Badge
+                      key={i}
+                      variant="outline"
+                      className="text-xs border-violet-700 text-violet-300 font-mono"
+                    >
+                      {d}
                     </Badge>
                   ))}
                 </div>
@@ -1669,6 +1754,396 @@ function ProposalRow({
                   {" "}+{proposal.sample_catalogs.length - 3} more
                 </span>
               )}
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Data domain discovery dialog (Phase 1 + 2 of the data-domain layer).
+//
+// One LLM call proposes the closed `data_domains` vocab AND maps each
+// active source-system canonical to the domains it serves. Persisting
+// flips the Sankey on Value & Readiness from 3 to 4 columns: source ->
+// domain -> use case -> department.
+// ---------------------------------------------------------------------------
+
+const DOMAIN_CATEGORY_BADGE: Record<string, string> = {
+  trading: "bg-amber-500/15 text-amber-300 border-amber-500/30",
+  operations: "bg-sky-500/15 text-sky-300 border-sky-500/30",
+  customer: "bg-emerald-500/15 text-emerald-300 border-emerald-500/30",
+  asset: "bg-indigo-500/15 text-indigo-300 border-indigo-500/30",
+  finance: "bg-violet-500/15 text-violet-300 border-violet-500/30",
+  risk: "bg-rose-500/15 text-rose-300 border-rose-500/30",
+  regulatory: "bg-orange-500/15 text-orange-300 border-orange-500/30",
+  external: "bg-slate-500/15 text-slate-300 border-slate-500/30",
+};
+
+function DomainDiscoveryDialog({
+  onClose,
+  onCommitted,
+}: {
+  onClose: () => void;
+  onCommitted: () => void;
+}) {
+  const [preview, setPreview] = useState<DomainsDiscoverOut | null>(null);
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [targetCount, setTargetCount] = useState(35);
+
+  const discoverMut = useMutation({
+    mutationFn: () =>
+      discoverDataDomains({
+        target_domain_count: targetCount,
+        include_existing_uc_text: true,
+      }),
+    onSuccess: (data) => {
+      setPreview(data);
+      // Default-select all proposed domains. The mapping table only
+      // surfaces canonicals connected to selected domains, so keeping a
+      // wide default makes the canonical block useful immediately.
+      setSelected(new Set(data.domains.map((d) => d.proposal_id)));
+    },
+    onError: (err: any) => {
+      const detail = err?.response?.data?.detail || err?.message || String(err);
+      toast.error(`Domain discovery failed: ${detail}`);
+    },
+  });
+
+  const commitMut = useMutation({
+    mutationFn: () =>
+      commitDiscoveredDataDomains({
+        preview_id: preview!.preview_id,
+        selected_domain_ids: Array.from(selected),
+        domains: preview!.domains,
+        canonical_mappings: preview!.canonical_mappings,
+      }),
+    onSuccess: (data) => {
+      const parts: string[] = [];
+      if (data.domains_inserted)
+        parts.push(`${data.domains_inserted} domain${data.domains_inserted === 1 ? "" : "s"}`);
+      if (data.canonical_maps_inserted)
+        parts.push(
+          `${data.canonical_maps_inserted} mapping${data.canonical_maps_inserted === 1 ? "" : "s"}`,
+        );
+      const msg = parts.length
+        ? `Added ${parts.join(" + ")}.`
+        : "Nothing new added (everything was already mapped).";
+      toast.success(
+        msg + ` Run "Tag UCs with domains" next to populate UC requirements.`,
+      );
+      onCommitted();
+    },
+    onError: (err: any) => {
+      const detail = err?.response?.data?.detail || err?.message || String(err);
+      toast.error(`Commit failed: ${detail}`);
+    },
+  });
+
+  useEffect(() => {
+    if (!preview && !discoverMut.isPending && !discoverMut.isError) {
+      discoverMut.mutate();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const toggleAll = (val: boolean) => {
+    if (!preview) return;
+    setSelected(val ? new Set(preview.domains.map((d) => d.proposal_id)) : new Set());
+  };
+
+  const toggleId = (id: string) => {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+
+  // Group domains by category for readable display.
+  const groupedDomains = useMemo(() => {
+    if (!preview) return [];
+    const m: Record<string, DomainProposal[]> = {};
+    for (const d of preview.domains) {
+      const cat = (d.category || "other").toLowerCase();
+      (m[cat] ||= []).push(d);
+    }
+    return Object.entries(m).sort(([a], [b]) => a.localeCompare(b));
+  }, [preview]);
+
+  // Build canonical -> selected-domain summary so the user can see
+  // "ServiceNow now maps to: outage_records, work_orders" only for
+  // domains they actually kept.
+  const selectedNames = useMemo(() => {
+    if (!preview) return new Set<string>();
+    const idToName = new Map(preview.domains.map((d) => [d.proposal_id, d.name]));
+    return new Set(Array.from(selected).map((id) => idToName.get(id) || ""));
+  }, [preview, selected]);
+
+  const filteredMappings: DomainCanonicalMapping[] = useMemo(() => {
+    if (!preview) return [];
+    return preview.canonical_mappings
+      .map((m) => ({
+        ...m,
+        domain_names: m.domain_names.filter((n) => selectedNames.has(n)),
+      }))
+      .filter((m) => m.domain_names.length > 0);
+  }, [preview, selectedNames]);
+
+  return (
+    <div
+      className="fixed inset-0 z-50 bg-black/60 flex items-center justify-center p-4"
+      onClick={onClose}
+    >
+      <div
+        className="bg-background border rounded-lg shadow-xl max-w-5xl w-full max-h-[90vh] overflow-hidden flex flex-col"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="px-6 py-4 border-b flex items-center justify-between">
+          <div>
+            <h2 className="text-lg font-semibold flex items-center gap-2">
+              <Layers className="h-5 w-5 text-violet-400" />
+              Build the data-domain layer
+            </h2>
+            <p className="text-xs text-muted-foreground mt-1 max-w-3xl">
+              Domains are <em>data needs</em> ("historical_market_prices",
+              "outage_records") decoupled from <em>products</em> (Snowflake,
+              Anaplan). The LLM proposes the vocab AND maps each active BHE
+              canonical to the domains it serves — so the Value &amp;
+              Readiness Sankey can show "this UC needs outage records, here
+              are the BHE sources that already provide them" instead of
+              speculating about specific products.
+            </p>
+          </div>
+          <button onClick={onClose} className="text-muted-foreground hover:text-foreground">
+            <X className="h-5 w-5" />
+          </button>
+        </div>
+
+        <div className="flex-1 overflow-y-auto px-6 py-4">
+          {discoverMut.isPending && !preview && (
+            <div className="flex items-center justify-center py-12 text-muted-foreground">
+              <Loader2 className="h-6 w-6 mr-2 animate-spin" />
+              Asking the LLM to propose data domains...
+            </div>
+          )}
+
+          {discoverMut.isError && !preview && (
+            <div className="text-center py-12">
+              <AlertCircle className="h-8 w-8 mx-auto text-rose-400 mb-2" />
+              <p className="text-sm text-muted-foreground mb-3">
+                Discovery failed. Check that company research and source-system
+                normalization have run (we need active canonicals to map from).
+              </p>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => discoverMut.mutate()}
+              >
+                Retry
+              </Button>
+            </div>
+          )}
+
+          {preview && (
+            <>
+              <div className="flex items-center justify-between mb-3">
+                <div className="text-sm text-muted-foreground">
+                  {preview.domains.length} domain
+                  {preview.domains.length === 1 ? "" : "s"} proposed across{" "}
+                  {preview.canonicals_considered.length} canonical
+                  {preview.canonicals_considered.length === 1 ? "" : "s"}.
+                  {preview.company_name ? ` Grounded on ${preview.company_name}.` : ""}
+                </div>
+                <div className="flex items-center gap-2">
+                  <Button variant="ghost" size="sm" onClick={() => toggleAll(true)}>
+                    Select all
+                  </Button>
+                  <Button variant="ghost" size="sm" onClick={() => toggleAll(false)}>
+                    Clear
+                  </Button>
+                </div>
+              </div>
+
+              <div className="space-y-3">
+                {groupedDomains.map(([cat, domains]) => (
+                  <div key={cat}>
+                    <div className="text-xs uppercase tracking-wider text-muted-foreground mb-1.5">
+                      <Badge
+                        variant="outline"
+                        className={DOMAIN_CATEGORY_BADGE[cat] || ""}
+                      >
+                        {cat}
+                      </Badge>
+                      <span className="ml-2 opacity-60">
+                        {domains.length} domain{domains.length === 1 ? "" : "s"}
+                      </span>
+                    </div>
+                    <div className="grid sm:grid-cols-2 gap-2">
+                      {domains.map((d) => (
+                        <DomainProposalRow
+                          key={d.proposal_id}
+                          domain={d}
+                          checked={selected.has(d.proposal_id)}
+                          onToggle={() => toggleId(d.proposal_id)}
+                        />
+                      ))}
+                    </div>
+                  </div>
+                ))}
+              </div>
+
+              {filteredMappings.length > 0 && (
+                <div className="mt-6 border-t pt-4">
+                  <div className="text-sm font-medium mb-2 flex items-center gap-2">
+                    <MapIcon className="h-4 w-4 text-sky-400" />
+                    Canonical &rarr; domain mappings
+                    <span className="text-xs text-muted-foreground font-normal">
+                      ({filteredMappings.length} of{" "}
+                      {preview.canonical_mappings.length} canonicals serve a
+                      selected domain)
+                    </span>
+                  </div>
+                  <div className="space-y-1.5 text-xs">
+                    {filteredMappings.map((m) => (
+                      <div
+                        key={m.canonical}
+                        className="flex items-start gap-2 py-1 border-b border-border/50 last:border-0"
+                      >
+                        <code className="font-mono bg-muted/40 px-1.5 py-0.5 rounded text-foreground/90">
+                          {m.canonical}
+                        </code>
+                        <span className="text-muted-foreground">→</span>
+                        <div className="flex-1 flex flex-wrap gap-1">
+                          {m.domain_names.map((n) => (
+                            <Badge
+                              key={n}
+                              variant="outline"
+                              className="text-xs font-mono opacity-90"
+                            >
+                              {n}
+                            </Badge>
+                          ))}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              <div className="mt-4 flex items-center gap-3 text-xs text-muted-foreground">
+                <span>Vocab size:</span>
+                <select
+                  value={targetCount}
+                  onChange={(e) => setTargetCount(Number(e.target.value))}
+                  className="border rounded-md bg-background h-7 px-2 text-xs"
+                >
+                  <option value={20}>~20 domains</option>
+                  <option value={35}>~35 domains</option>
+                  <option value={50}>~50 domains</option>
+                </select>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => {
+                    setPreview(null);
+                    setSelected(new Set());
+                    discoverMut.mutate();
+                  }}
+                  disabled={discoverMut.isPending}
+                >
+                  {discoverMut.isPending ? (
+                    <Loader2 className="h-3 w-3 animate-spin" />
+                  ) : (
+                    "Re-discover"
+                  )}
+                </Button>
+              </div>
+            </>
+          )}
+        </div>
+
+        {preview && (
+          <div className="border-t px-6 py-4 flex items-center justify-between">
+            <div className="text-sm text-muted-foreground">
+              {selected.size} of {preview.domains.length} domains selected ·{" "}
+              {filteredMappings.length} canonical mapping
+              {filteredMappings.length === 1 ? "" : "s"} will be written
+            </div>
+            <div className="flex items-center gap-2">
+              <Button variant="ghost" onClick={onClose}>
+                Cancel
+              </Button>
+              <Button
+                onClick={() => commitMut.mutate()}
+                disabled={selected.size === 0 || commitMut.isPending}
+              >
+                {commitMut.isPending ? (
+                  <>
+                    <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+                    Committing...
+                  </>
+                ) : (
+                  `Commit ${selected.size} domain${selected.size === 1 ? "" : "s"}`
+                )}
+              </Button>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function DomainProposalRow({
+  domain,
+  checked,
+  onToggle,
+}: {
+  domain: DomainProposal;
+  checked: boolean;
+  onToggle: () => void;
+}) {
+  return (
+    <div
+      className={`border rounded-md p-2.5 cursor-pointer transition-colors text-xs ${
+        checked ? "border-primary/50 bg-primary/5" : "hover:bg-muted/30"
+      }`}
+      onClick={onToggle}
+    >
+      <div className="flex items-start gap-2">
+        <input
+          type="checkbox"
+          checked={checked}
+          onChange={onToggle}
+          onClick={(e) => e.stopPropagation()}
+          className="mt-0.5"
+        />
+        <div className="flex-1 min-w-0">
+          <div className="flex items-center gap-2 flex-wrap">
+            <span className="font-medium text-sm">{domain.label}</span>
+            <code className="font-mono text-[10px] text-muted-foreground bg-muted/40 px-1 py-0.5 rounded">
+              {domain.name}
+            </code>
+          </div>
+          {domain.description && (
+            <p className="text-muted-foreground mt-1 leading-snug">
+              {domain.description}
+            </p>
+          )}
+          {domain.example_attributes.length > 0 && (
+            <div className="mt-1.5 flex flex-wrap gap-1 opacity-80">
+              {domain.example_attributes.slice(0, 5).map((a) => (
+                <span
+                  key={a}
+                  className="text-[10px] font-mono bg-muted/40 px-1 py-0.5 rounded"
+                >
+                  {a}
+                </span>
+              ))}
             </div>
           )}
         </div>
