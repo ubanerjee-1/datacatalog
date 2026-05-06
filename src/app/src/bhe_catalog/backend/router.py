@@ -3230,21 +3230,44 @@ async def value_sankey(
             FROM uc_src s
             JOIN uc_src_count sc ON sc.uc_id = s.uc_id
             GROUP BY s.required_canonical, s.uc_id, s.use_case_name
+        ),
+        -- "Unlock potential" for each canonical. Ingesting a canonical
+        -- gates this many UCs cumulatively worth this much. Drives the
+        -- Sankey gap-node tooltip ("ingest X to unlock 5 UCs worth $24M").
+        -- We count distinct UCs and sum their full $ value so the metric
+        -- is "max upside if this single canonical is delivered" — UCs
+        -- with multiple gaps will appear in multiple canonicals' unlock
+        -- numbers, which is intentional (each canonical is gating that
+        -- UC; ingesting any one of them is necessary).
+        src_unlock AS (
+            SELECT s.required_canonical AS canonical,
+                   COUNT(DISTINCT s.uc_id) AS unlocks_uc_count,
+                   SUM(s.value) AS unlocks_value_usd,
+                   COUNT(DISTINCT CASE WHEN s.necessity = 'must_have'
+                                       THEN s.uc_id END) AS unlocks_must_have_count
+            FROM uc_src s
+            GROUP BY s.required_canonical
         )
         SELECT 'src_uc' AS kind, required_canonical AS a, uc_id AS b,
                link_value, uc_id, use_case_name,
-               NULL AS uc_value, NULL AS num, NULL AS den, NULL AS department
+               NULL AS uc_value, NULL AS num, NULL AS den, NULL AS department,
+               NULL AS unlocks_uc_count, NULL AS unlocks_value_usd,
+               NULL AS unlocks_must_have_count
         FROM link_src_uc
         UNION ALL
         SELECT 'uc_dept' AS kind, uc_id AS a, department AS b,
                value AS link_value, uc_id, use_case_name,
-               value AS uc_value, num, den, department
+               value AS uc_value, num, den, department,
+               NULL AS unlocks_uc_count, NULL AS unlocks_value_usd,
+               NULL AS unlocks_must_have_count
         FROM top_uc
         UNION ALL
-        SELECT 'src_meta' AS kind, canonical AS a, NULL AS b,
-               CAST(is_present AS DOUBLE) AS link_value,
-               NULL, NULL, NULL, NULL, NULL, NULL
-        FROM src_present
+        SELECT 'src_meta' AS kind, sp.canonical AS a, NULL AS b,
+               CAST(sp.is_present AS DOUBLE) AS link_value,
+               NULL, NULL, NULL, NULL, NULL, NULL,
+               su.unlocks_uc_count, su.unlocks_value_usd, su.unlocks_must_have_count
+        FROM src_present sp
+        LEFT JOIN src_unlock su ON su.canonical = sp.canonical
     """
 
     try:
@@ -3254,6 +3277,7 @@ async def value_sankey(
         return {"nodes": [], "links": [], "metadata": {"error": str(e)}}
 
     src_present_map: dict[str, bool] = {}
+    src_unlock_map: dict[str, dict] = {}
     src_uc_links: list[dict] = []
     uc_dept_links: list[dict] = []
     uc_meta: dict[str, dict] = {}
@@ -3261,7 +3285,13 @@ async def value_sankey(
     for r in rows:
         kind = r.get("kind")
         if kind == "src_meta":
-            src_present_map[r.get("a")] = bool(_to_int(r.get("link_value")))
+            cn = r.get("a")
+            src_present_map[cn] = bool(_to_int(r.get("link_value")))
+            src_unlock_map[cn] = {
+                "unlocks_uc_count": _to_int(r.get("unlocks_uc_count")),
+                "unlocks_value_usd": float(r.get("unlocks_value_usd") or 0),
+                "unlocks_must_have_count": _to_int(r.get("unlocks_must_have_count")),
+            }
         elif kind == "src_uc":
             v = float(r.get("link_value") or 0)
             uc_id = r.get("uc_id")
@@ -3295,22 +3325,51 @@ async def value_sankey(
     nodes = []
     for name in sources:
         is_present = src_present_map.get(name, False)
+        unlock = src_unlock_map.get(name) or {}
         nodes.append({
             "id": f"src::{name}",
             "name": name,
             "category": "source",
             "level": 0,
             "color": "hsl(174, 80%, 55%)" if is_present else "hsl(0, 75%, 55%)",
-            "metadata": {"is_present": is_present},
+            "metadata": {
+                "is_present": is_present,
+                # Mirror is_present negation as is_gap so the SankeyDiagram
+                # component's existing `metadata.is_gap` codepath (which
+                # forces GAP_COLOR) lights up uniformly with backend-set
+                # node.color. Both work today; this keeps them in sync.
+                "is_gap": not is_present,
+                # Unlock-potential metric for the gap-node tooltip:
+                # "ingest <name> to unlock {N} UCs worth ${V}M". For
+                # already-present canonicals we still surface these so
+                # tooltips can show "supports {N} UCs ($V) in this scope".
+                "unlocks_uc_count": unlock.get("unlocks_uc_count", 0),
+                "unlocks_value_usd": unlock.get("unlocks_value_usd", 0.0),
+                "unlocks_must_have_count": unlock.get("unlocks_must_have_count", 0),
+            },
         })
     for uc_id in use_cases:
         m = uc_meta[uc_id]
         ratio = (m["num"] / m["den"]) if m["den"] > 0 else 0
-        if ratio >= 1.0:    color = "hsl(140, 60%, 45%)"
-        elif ratio >= 0.75: color = "hsl(80, 60%, 50%)"
-        elif ratio >= 0.50: color = "hsl(45, 80%, 55%)"
-        elif ratio >= 0.25: color = "hsl(25, 80%, 55%)"
-        else:               color = "hsl(0, 75%, 55%)"
+        # Bucket boundaries match the color computation 1:1 — keep them
+        # in sync if you tweak either side. Surfacing the bucket as a
+        # string lets the UI label/group/tooltip without re-deriving it
+        # from readiness_pct (which has rounding edge cases at the seams).
+        if ratio >= 1.0:
+            color = "hsl(140, 60%, 45%)"
+            bucket = "ready"
+        elif ratio >= 0.75:
+            color = "hsl(80, 60%, 50%)"
+            bucket = "near_ready"
+        elif ratio >= 0.50:
+            color = "hsl(45, 80%, 55%)"
+            bucket = "partial"
+        elif ratio >= 0.25:
+            color = "hsl(25, 80%, 55%)"
+            bucket = "low"
+        else:
+            color = "hsl(0, 75%, 55%)"
+            bucket = "missing"
         nodes.append({
             "id": f"uc::{uc_id}",
             "name": m["name"],
@@ -3320,6 +3379,7 @@ async def value_sankey(
             "metadata": {
                 "value_usd": m["value"],
                 "readiness_pct": round(100 * ratio, 1),
+                "readiness_bucket": bucket,
                 "num": m["num"], "den": m["den"],
                 "department": m["department"],
             },

@@ -447,6 +447,63 @@ export default function SankeyDiagram({
         if (node.level === 0 && schemaCount > 0) {
           tooltipParts.push(`Click to view ${schemaCount} schema(s)`);
         }
+
+        // Source-system "unlock potential" hint for the value-readiness
+        // Sankey. Backend (/api/value/sankey) populates these fields on
+        // every source node; legacy Sankey payloads that don't set them
+        // simply skip this branch (numbers will be 0/undefined).
+        const meta = (node.metadata || {}) as Record<string, unknown>;
+        const isSourceCategory = node.category === "source";
+        const unlocksUc = Number(meta.unlocks_uc_count || 0);
+        const unlocksValue = Number(meta.unlocks_value_usd || 0);
+        const unlocksMust = Number(meta.unlocks_must_have_count || 0);
+        if (isSourceCategory && unlocksUc > 0) {
+          const isGap =
+            meta.is_gap === true ||
+            meta.is_gap === "true" ||
+            meta.is_present === false;
+          const verb = isGap ? "Ingest to unlock" : "Supports";
+          const valueLabel =
+            unlocksValue >= 1e9
+              ? `$${(unlocksValue / 1e9).toFixed(1)}B`
+              : unlocksValue >= 1e6
+                ? `$${(unlocksValue / 1e6).toFixed(1)}M`
+                : unlocksValue >= 1e3
+                  ? `$${(unlocksValue / 1e3).toFixed(0)}K`
+                  : `$${Math.round(unlocksValue)}`;
+          const mustLabel = unlocksMust > 0 ? ` (${unlocksMust} must-have)` : "";
+          tooltipParts.push(
+            `${verb} ${unlocksUc} UC${unlocksUc === 1 ? "" : "s"}${mustLabel} · ${valueLabel}`,
+          );
+        }
+
+        // Use-case node summary: readiness % + bucket + $ value. The
+        // value-readiness Sankey sets `readiness_pct`, `readiness_bucket`,
+        // and `value_usd` on UC nodes; absent on legacy Sankey payloads.
+        if (node.category === "use_case") {
+          const pct = meta.readiness_pct;
+          const bucket = (meta.readiness_bucket as string | undefined) || "";
+          const value = Number(meta.value_usd || 0);
+          const bits: string[] = [];
+          if (typeof pct === "number") {
+            bits.push(`${pct.toFixed(0)}% ready`);
+          }
+          if (bucket && bucket !== "ready") {
+            bits.push(bucket.replace(/_/g, " "));
+          }
+          if (value > 0) {
+            bits.push(
+              value >= 1e6
+                ? `$${(value / 1e6).toFixed(1)}M`
+                : value >= 1e3
+                  ? `$${(value / 1e3).toFixed(0)}K`
+                  : `$${Math.round(value)}`,
+            );
+          }
+          if (bits.length > 0) {
+            tooltipParts.push(bits.join(" · "));
+          }
+        }
         setTooltip({
           x: (e as MouseEvent).offsetX,
           y: (e as MouseEvent).offsetY - 14,
