@@ -339,6 +339,79 @@ class UseCaseGenerateCommitOut(BaseModel):
     use_case_ids: list[str] = Field(default_factory=list)
 
 
+# --- Program Discovery (LLM-assisted catalog -> program -> affiliate mapping) ---
+# Closes the upstream gap that makes `lens=ready` UC generation useless: with
+# zero `category=program` rules in `classification_rules`, every schema lands
+# in `silver_schemas.program='Other'/'Unknown'` and the affiliate-to-canonical
+# join (used by _resolve_canonicals_for_affiliate) returns nothing. This
+# discovery flow looks at the top catalog prefixes in `silver_schemas`, the
+# closed list of affiliates from `gold.affiliates`, and the company profile,
+# then asks the LLM to propose (catalog_pattern, program_name, affiliate_name)
+# triples in one shot. Commit writes both `classification_rules` rows
+# (category='program') and `program_affiliate_map` rows, then can auto-fire
+# populate-gold so silver_schemas.program backfills.
+
+class ProgramDiscoveryProposal(BaseModel):
+    """A single LLM-proposed catalog -> program -> affiliate mapping."""
+    proposal_id: str  # stable hash of catalog_pattern; idempotent across runs
+    catalog_pattern: str  # bare prefix, e.g. "pacmdl" (no glob)
+    program_name: str  # human-friendly label, e.g. "PacifiCorp Meter Data"
+    affiliate_name: str  # must be in gold.affiliates closed vocab
+    sample_catalogs: list[str] = Field(default_factory=list)
+    schema_count: int = 0
+    confidence: str = "medium"  # high | medium | low
+    rationale: str = ""
+
+
+class ProgramsDiscoverIn(BaseModel):
+    """Request body for ``POST /api/programs/discover`` (dry-run preview).
+
+    The LLM uses the top ``top_n`` catalog prefixes by schema count plus the
+    full affiliate list to propose mappings. Defaults are tuned to fit in
+    one prompt without truncation while still covering the long tail.
+    """
+    top_n: int = 25  # 5..50; how many prefixes to consider
+    min_schema_count: int = 3  # ignore one-off prefixes
+
+
+class ProgramsDiscoverOut(BaseModel):
+    """Preview response. ``preview_id`` is short-lived (~10 minutes)."""
+    preview_id: str
+    proposals: list[ProgramDiscoveryProposal]
+    company_name: str = ""
+    affiliates_considered: list[str] = Field(default_factory=list)
+    expires_at: Optional[str] = None
+
+
+class ProgramsDiscoverCommitIn(BaseModel):
+    """Persist selected proposals into ``classification_rules`` +
+    ``program_affiliate_map``. Optional ``edits`` lets the UI override
+    program_name / affiliate_name / catalog_pattern per proposal_id before
+    writing.
+
+    The server cache (keyed by ``preview_id``) is in-process, so when the app
+    runs with ``--workers > 1`` the discover and commit calls may hit
+    different workers and the cache lookup misses. To make the flow robust
+    across restarts and worker splits, the client SHOULD also send back the
+    full ``proposals`` payload it received from /programs/discover; the
+    backend prefers the cached entry when present and falls back to this
+    inline payload otherwise.
+    """
+    preview_id: str
+    selected_ids: list[str] = Field(default_factory=list)
+    edits: dict[str, dict] = Field(default_factory=dict)
+    run_populate_gold: bool = True
+    proposals: Optional[list[ProgramDiscoveryProposal]] = None
+
+
+class ProgramsDiscoverCommitOut(BaseModel):
+    rules_inserted: int
+    rules_skipped: int
+    maps_inserted: int
+    maps_skipped: int
+    populate_gold_run_id: Optional[str] = None
+
+
 # --- Edit Center: bhe_gold dimension tables ---
 
 class AffiliateUpsertIn(BaseModel):

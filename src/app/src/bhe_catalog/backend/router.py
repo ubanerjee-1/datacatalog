@@ -82,6 +82,11 @@ from .models import (
     TAXONOMY_ALLOWED_VALUES,
     TAXONOMY_DIMENSIONS,
     USE_CASE_STATUSES,
+    ProgramsDiscoverCommitIn,
+    ProgramsDiscoverCommitOut,
+    ProgramsDiscoverIn,
+    ProgramsDiscoverOut,
+    ProgramDiscoveryProposal,
     UseCaseAffiliateUpsertIn,
     UseCaseCandidate,
     UseCaseCreateIn,
@@ -5319,6 +5324,521 @@ async def commit_generated_use_cases(
         inserted=len(inserted),
         skipped=skipped,
         use_case_ids=inserted,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Program discovery: LLM-assisted catalog -> program -> affiliate seeding.
+#
+# Why this exists: the affiliate -> canonicals join used by `lens=ready` UC
+# generation hangs off `silver_schemas.program -> program_affiliate_map`. On a
+# fresh deploy there are zero `category=program` rules in `classification_rules`,
+# so every schema lands in `program='Other'/'Unknown'` and the join returns
+# nothing. CRUD-editing program_affiliate_map by hand is busywork; the catalog
+# names already encode the structure (e.g. `pacmdl_*` is obviously PacifiCorp
+# Meter Data Logging, `npg_*` is Northern Powergrid). One ai_query pass over
+# the top catalog prefixes plus the affiliate list closes the gap.
+#
+# Flow: discover (dry-run, returns proposals) -> commit (persist selected,
+# auto-fire populate-gold so silver_schemas.program backfills).
+# ---------------------------------------------------------------------------
+
+_program_preview_cache: dict[str, tuple[float, dict]] = {}
+_PROGRAM_PREVIEW_TTL_SEC = 10 * 60
+
+
+def _program_preview_gc() -> None:
+    cutoff = time.time() - _PROGRAM_PREVIEW_TTL_SEC
+    stale = [k for k, (ts, _) in _program_preview_cache.items() if ts < cutoff]
+    for k in stale:
+        _program_preview_cache.pop(k, None)
+
+
+_PROGRAM_DISCOVERY_RESPONSE_SCHEMA = json.dumps({
+    "type": "json_schema",
+    "json_schema": {
+        "name": "program_proposals",
+        "schema": {
+            "type": "object",
+            "properties": {
+                "proposals": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "catalog_pattern": {"type": "string"},
+                            "program_name": {"type": "string"},
+                            "affiliate_name": {"type": "string"},
+                            "confidence": {
+                                "type": "string",
+                                "enum": ["high", "medium", "low"],
+                            },
+                            "rationale": {"type": "string"},
+                        },
+                        "required": [
+                            "catalog_pattern", "program_name", "affiliate_name",
+                            "confidence", "rationale",
+                        ],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            "required": ["proposals"],
+            "additionalProperties": False,
+        },
+        "strict": True,
+    },
+})
+
+
+def _affiliates_for_discovery() -> list[dict]:
+    """Closed list of affiliates to constrain the LLM's choices."""
+    gold = get_gold_schema()
+    try:
+        rows = execute_query(
+            f"SELECT affiliate_name, business_type, region, description "
+            f"FROM {fqn(gold, 'affiliates')} "
+            f"WHERE COALESCE(is_active, true) = true "
+            f"ORDER BY affiliate_name"
+        )
+        return rows or []
+    except Exception as e:
+        logger.warning(f"_affiliates_for_discovery failed: {e}")
+        return []
+
+
+def _existing_program_patterns() -> set[str]:
+    """Patterns already in classification_rules so we don't re-propose them."""
+    gold = get_gold_schema()
+    try:
+        rows = execute_query(
+            f"SELECT pattern FROM {fqn(gold, 'classification_rules')} "
+            f"WHERE category = 'program' AND COALESCE(is_active, true) = true"
+        )
+        return {(r.get("pattern") or "").strip().lower() for r in rows or [] if r.get("pattern")}
+    except Exception as e:
+        logger.warning(f"_existing_program_patterns failed: {e}")
+        return set()
+
+
+def _top_catalog_prefixes(top_n: int, min_schema_count: int) -> list[dict]:
+    """Aggregate distinct catalog prefixes (first underscore segment) and
+    surface schema counts plus a few sample catalog names for the LLM prompt.
+    Filters out the universal-ignore Databricks system catalogs and any
+    prefix already covered by an existing program rule.
+    """
+    silver = get_silver_schema()
+    skip_patterns = _existing_program_patterns()
+    try:
+        rows = execute_query(f"""
+            WITH base AS (
+              SELECT
+                CASE
+                  WHEN catalog_name RLIKE '^[a-z0-9]+_'
+                    THEN REGEXP_EXTRACT(LOWER(catalog_name), '^([a-z0-9]+)_', 1)
+                  ELSE LOWER(catalog_name)
+                END AS prefix,
+                catalog_name
+              FROM {fqn(silver, 'silver_schemas')}
+              WHERE catalog_name NOT IN ('samples', 'system')
+                AND catalog_name NOT LIKE '__databricks_internal_%'
+            )
+            SELECT
+              prefix,
+              COUNT(*) AS schema_count,
+              COUNT(DISTINCT catalog_name) AS catalog_count,
+              SLICE(ARRAY_DISTINCT(COLLECT_LIST(catalog_name)), 1, 5) AS samples
+            FROM base
+            GROUP BY prefix
+            HAVING COUNT(*) >= {int(min_schema_count)}
+            ORDER BY schema_count DESC
+            LIMIT {int(top_n) * 2}
+        """)
+    except Exception as e:
+        logger.exception("_top_catalog_prefixes failed")
+        raise HTTPException(500, f"Could not query catalog prefixes: {e}")
+
+    out: list[dict] = []
+    for r in rows or []:
+        prefix = (r.get("prefix") or "").strip().lower()
+        if not prefix or prefix in skip_patterns:
+            continue
+        samples_raw = r.get("samples") or []
+        if isinstance(samples_raw, str):
+            try:
+                samples_raw = json.loads(samples_raw)
+            except Exception:
+                samples_raw = [samples_raw]
+        out.append({
+            "prefix": prefix,
+            "schema_count": int(r.get("schema_count") or 0),
+            "catalog_count": int(r.get("catalog_count") or 0),
+            "sample_catalogs": [str(s) for s in samples_raw if s][:5],
+        })
+        if len(out) >= top_n:
+            break
+    return out
+
+
+def _build_program_discovery_prompt(
+    profile: dict,
+    affiliates: list[dict],
+    prefixes: list[dict],
+) -> str:
+    """JSON-anchored prompt the LLM responds to under strict schema."""
+    company = (profile.get("company_name") or "the company").strip()
+    industry = (profile.get("industry") or "").strip()
+    sub_industry = (profile.get("sub_industry") or "").strip()
+
+    affiliate_lines: list[str] = []
+    for a in affiliates:
+        n = (a.get("affiliate_name") or "").strip()
+        if not n:
+            continue
+        bt = (a.get("business_type") or "").strip()
+        rg = (a.get("region") or "").strip()
+        bits = [n]
+        if bt:
+            bits.append(f"type={bt}")
+        if rg:
+            bits.append(f"region={rg}")
+        affiliate_lines.append("- " + " | ".join(bits))
+    affiliate_block = "\n".join(affiliate_lines) if affiliate_lines else "(none)"
+
+    prefix_lines: list[str] = []
+    for p in prefixes:
+        samples = ", ".join(p.get("sample_catalogs") or [])
+        prefix_lines.append(
+            f"- pattern='{p['prefix']}' "
+            f"(schemas={p['schema_count']}, catalogs={p['catalog_count']}, "
+            f"samples=[{samples}])"
+        )
+    prefix_block = "\n".join(prefix_lines)
+
+    return (
+        f"You are a data catalog architect for {company}.\n"
+        f"Industry: {industry}{f' / {sub_industry}' if sub_industry else ''}.\n\n"
+        "TASK: Map each catalog-name prefix to a human-friendly program/system "
+        "name AND to the most likely operating affiliate. The catalog naming is "
+        "typically structured as <program>_<env><version>_<zone> (e.g. "
+        "'pacmdl_prod02_raw'), where the program prefix is a code for a "
+        "business system or program. Use industry intuition + the sample "
+        "catalog names to infer what each prefix represents.\n\n"
+        "RULES:\n"
+        "- The 'affiliate_name' MUST be one of the closed list below "
+        "(case-sensitive exact match). If no affiliate fits, pick the parent "
+        "company affiliate.\n"
+        "- 'catalog_pattern' MUST be the bare prefix (no glob/wildcard, no "
+        "underscore suffix). The classifier will match `{prefix}_*` automatically.\n"
+        "- 'program_name' should be a short business label (3-6 words), e.g. "
+        "'PacifiCorp Meter Data', 'Asset Performance Management', 'Northern "
+        "Powergrid Customer CRM'. Avoid raw codes.\n"
+        "- 'confidence' should be 'high' when the prefix maps unambiguously "
+        "(e.g. 'npg' clearly = Northern Powergrid in a BHE context); 'medium' "
+        "when reasonable but inferred; 'low' when speculative.\n"
+        "- 'rationale' should be one sentence explaining why this prefix maps "
+        "to that program/affiliate (cite the prefix decoding and any sample "
+        "catalog name evidence).\n"
+        "- Return EXACTLY one proposal per input prefix. Do not invent extra "
+        "prefixes.\n\n"
+        f"AFFILIATES (closed vocabulary — exact match required):\n{affiliate_block}\n\n"
+        f"CATALOG PREFIXES TO MAP:\n{prefix_block}\n\n"
+        "Return a JSON object: {\"proposals\":[{...}]}"
+    )
+
+
+def _proposal_id(catalog_pattern: str) -> str:
+    h = hashlib.sha1(
+        (catalog_pattern or "").strip().lower().encode("utf-8")
+    ).hexdigest()[:12]
+    return f"prop_{h}"
+
+
+@router.post(
+    "/programs/discover",
+    response_model=ProgramsDiscoverOut,
+    operation_id="discoverPrograms",
+)
+async def discover_programs(body: ProgramsDiscoverIn) -> ProgramsDiscoverOut:
+    """Dry-run propose ``(catalog_pattern -> program -> affiliate)`` rows by
+    asking the LLM to interpret the top catalog prefixes against the closed
+    affiliate vocabulary. Returns a preview cached server-side; commit the
+    chosen ``proposal_id``s via ``/programs/discover/commit``.
+    """
+    _program_preview_gc()
+    top_n = max(5, min(50, int(body.top_n or 25)))
+    min_count = max(1, int(body.min_schema_count or 3))
+
+    profile = _company_profile_dict()
+    affiliates = _affiliates_for_discovery()
+    if not affiliates:
+        raise HTTPException(
+            422,
+            "No active affiliates found. Run Company Research first so the "
+            "discovery has a closed vocabulary to map against.",
+        )
+
+    prefixes = _top_catalog_prefixes(top_n=top_n, min_schema_count=min_count)
+    if not prefixes:
+        raise HTTPException(
+            422,
+            "No catalog prefixes left to map (silver_schemas is empty or all "
+            "prefixes are already covered by classification_rules).",
+        )
+
+    prompt = _build_program_discovery_prompt(
+        profile=profile,
+        affiliates=affiliates,
+        prefixes=prefixes,
+    )
+
+    try:
+        raw = _ai_query(prompt, response_format=_PROGRAM_DISCOVERY_RESPONSE_SCHEMA)
+    except Exception as e:
+        logger.exception("discover_programs: ai_query failed")
+        raise HTTPException(502, f"LLM discovery failed: {e}")
+
+    try:
+        parsed = json.loads(raw) if raw else {}
+        items = parsed.get("proposals", []) if isinstance(parsed, dict) else []
+        if not isinstance(items, list):
+            items = []
+    except Exception as e:
+        logger.warning(f"discover_programs: parse failed: {e!r} raw={raw[:300]!r}")
+        items = []
+
+    # Index inputs so we can attach schema_count + samples to the LLM output.
+    by_prefix = {p["prefix"]: p for p in prefixes}
+    valid_affiliates = {(a.get("affiliate_name") or "").strip(): a for a in affiliates}
+
+    proposals: list[ProgramDiscoveryProposal] = []
+    seen_patterns: set[str] = set()
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        pat = (it.get("catalog_pattern") or "").strip().lower().rstrip("_*")
+        if not pat or pat in seen_patterns:
+            continue
+        meta = by_prefix.get(pat)
+        if not meta:
+            # LLM hallucinated a prefix; skip rather than persist garbage.
+            continue
+        aff = (it.get("affiliate_name") or "").strip()
+        if aff not in valid_affiliates:
+            # Soft fallback: pick the corporate / parent affiliate if we have one.
+            corporate = next(
+                (a for a in affiliates
+                 if (a.get("business_type") or "").lower() == "corporate"),
+                affiliates[0],
+            )
+            aff = (corporate.get("affiliate_name") or "").strip()
+        seen_patterns.add(pat)
+        proposals.append(ProgramDiscoveryProposal(
+            proposal_id=_proposal_id(pat),
+            catalog_pattern=pat,
+            program_name=str(it.get("program_name") or "").strip() or pat.upper(),
+            affiliate_name=aff,
+            sample_catalogs=meta.get("sample_catalogs") or [],
+            schema_count=meta.get("schema_count") or 0,
+            confidence=str(it.get("confidence") or "medium").lower().strip(),
+            rationale=str(it.get("rationale") or ""),
+        ))
+
+    if not proposals:
+        raise HTTPException(
+            502,
+            "LLM returned no usable proposals. Try lowering top_n or rerun.",
+        )
+
+    # Sort by schema_count desc so the user sees the highest-impact mappings first.
+    proposals.sort(key=lambda p: (-p.schema_count, p.catalog_pattern))
+
+    preview_id = f"progprev_{uuid.uuid4().hex[:14]}"
+    expires_at = datetime.utcfromtimestamp(time.time() + _PROGRAM_PREVIEW_TTL_SEC).isoformat() + "Z"
+    out = ProgramsDiscoverOut(
+        preview_id=preview_id,
+        proposals=proposals,
+        company_name=str(profile.get("company_name") or ""),
+        affiliates_considered=[a.get("affiliate_name") or "" for a in affiliates],
+        expires_at=expires_at,
+    )
+    _program_preview_cache[preview_id] = (time.time(), out.model_dump())
+    return out
+
+
+@router.post(
+    "/programs/discover/commit",
+    response_model=ProgramsDiscoverCommitOut,
+    operation_id="commitDiscoveredPrograms",
+)
+async def commit_discovered_programs(
+    body: ProgramsDiscoverCommitIn,
+) -> ProgramsDiscoverCommitOut:
+    """Persist selected program proposals: writes ``classification_rules``
+    (category='program') AND ``program_affiliate_map`` rows in one shot.
+    Optionally fires populate-gold so ``silver_schemas.program`` backfills
+    immediately and the affiliate facet on /use-cases starts surfacing real
+    canonicals for ``lens=ready``.
+
+    Idempotent on (catalog_pattern) and (program, affiliate_name): a second
+    commit with the same proposals is a no-op (rows are skipped, not
+    duplicated, regardless of whether the user ran discover twice).
+    """
+    _program_preview_gc()
+    cached = _program_preview_cache.get(body.preview_id)
+    if cached:
+        _, payload = cached
+        proposals_raw: list[dict] = payload.get("proposals") or []
+    elif body.proposals:
+        # Inline fallback: client sent the proposals back. Necessary when
+        # /workers > 1 splits discover and commit across processes and the
+        # cache lookup misses (B-024 followup; same gap exists for UC
+        # generation but the user-visible blast radius is smaller there).
+        proposals_raw = [p.model_dump() for p in body.proposals]
+    else:
+        raise HTTPException(
+            410,
+            "Preview not found in server cache and no inline proposals were "
+            "provided. Re-run /programs/discover, or include the `proposals` "
+            "array in the commit body.",
+        )
+    by_id = {p.get("proposal_id"): p for p in proposals_raw if p.get("proposal_id")}
+
+    selected_ids = list(body.selected_ids or [])
+    if not selected_ids:
+        selected_ids = [p.get("proposal_id") for p in proposals_raw if p.get("proposal_id")]
+
+    edits = body.edits or {}
+    gold = get_gold_schema()
+    rules_inserted = 0
+    rules_skipped = 0
+    maps_inserted = 0
+    maps_skipped = 0
+
+    for pid in selected_ids:
+        prop = by_id.get(pid)
+        if not prop:
+            rules_skipped += 1
+            maps_skipped += 1
+            continue
+        edit = edits.get(pid) or {}
+        pattern = (
+            edit.get("catalog_pattern") or prop.get("catalog_pattern") or ""
+        ).strip().lower().rstrip("_*")
+        program_name = (
+            edit.get("program_name") or prop.get("program_name") or ""
+        ).strip()
+        affiliate_name = (
+            edit.get("affiliate_name") or prop.get("affiliate_name") or ""
+        ).strip()
+        if not pattern or not program_name or not affiliate_name:
+            rules_skipped += 1
+            maps_skipped += 1
+            continue
+
+        # 1) classification_rules row (category='program')
+        try:
+            existing = execute_query(
+                f"SELECT rule_id FROM {fqn(gold, 'classification_rules')} "
+                f"WHERE category = 'program' "
+                f"  AND LOWER(pattern) = LOWER('{_sql_escape(pattern)}') "
+                f"LIMIT 1"
+            )
+            if existing:
+                rules_skipped += 1
+            else:
+                rule_id = f"prog_{uuid.uuid4().hex[:10]}"
+                meta = json.dumps({
+                    "affiliate": affiliate_name,
+                    "discovered_by": "discover_programs",
+                    "confidence": prop.get("confidence", "medium"),
+                })
+                execute_query(f"""
+                    INSERT INTO {fqn(gold, 'classification_rules')}
+                        (rule_id, category, pattern, label, description,
+                         metadata, is_active, display_order, created_at, updated_at)
+                    VALUES (
+                        '{_sql_escape(rule_id)}',
+                        'program',
+                        '{_sql_escape(pattern)}',
+                        '{_sql_escape(program_name)}',
+                        '{_sql_escape((prop.get('rationale') or '')[:500])}',
+                        '{_sql_escape(meta)}',
+                        true,
+                        100,
+                        current_timestamp(),
+                        current_timestamp()
+                    )
+                """)
+                rules_inserted += 1
+        except Exception as e:
+            logger.warning(f"commit rule insert failed for {pattern!r}: {e}")
+            rules_skipped += 1
+
+        # 2) program_affiliate_map row (program=program_name, affiliate)
+        try:
+            existing = execute_query(
+                f"SELECT program FROM {fqn(gold, 'program_affiliate_map')} "
+                f"WHERE LOWER(program) = LOWER('{_sql_escape(program_name)}') "
+                f"  AND LOWER(affiliate_name) = LOWER('{_sql_escape(affiliate_name)}') "
+                f"LIMIT 1"
+            )
+            if existing:
+                maps_skipped += 1
+            else:
+                # Schema for program_affiliate_map only has `updated_at` —
+                # there is no `created_at`. (Confirmed via DESCRIBE TABLE on
+                # ub_test.bhe_gold.program_affiliate_map; a previous version
+                # of this code included created_at and failed with
+                # UNRESOLVED_COLUMN.)
+                execute_query(f"""
+                    INSERT INTO {fqn(gold, 'program_affiliate_map')}
+                        (program, affiliate_name, affiliation_strength, notes,
+                         is_user_edited, updated_at)
+                    VALUES (
+                        '{_sql_escape(program_name)}',
+                        '{_sql_escape(affiliate_name)}',
+                        'primary',
+                        'Created by program discovery (LLM-proposed, user-confirmed)',
+                        true,
+                        current_timestamp()
+                    )
+                """)
+                maps_inserted += 1
+        except Exception as e:
+            logger.warning(f"commit map insert failed for ({program_name!r}, {affiliate_name!r}): {e}")
+            maps_skipped += 1
+
+    _program_preview_cache.pop(body.preview_id, None)
+
+    populate_gold_run_id: Optional[str] = None
+    if body.run_populate_gold and (rules_inserted or maps_inserted):
+        try:
+            populate_gold_run_id = str(uuid.uuid4())[:8]
+            _upsert_run(
+                populate_gold_run_id,
+                status="PENDING",
+                start_time=datetime.utcnow().isoformat(),
+                end_time=None,
+                error=None,
+                job_type="populate-gold",
+            )
+            thread = threading.Thread(
+                target=_run_populate_gold,
+                args=(populate_gold_run_id,),
+                daemon=True,
+            )
+            thread.start()
+        except Exception as e:
+            logger.warning(f"auto-fire populate-gold failed: {e}")
+            populate_gold_run_id = None
+
+    return ProgramsDiscoverCommitOut(
+        rules_inserted=rules_inserted,
+        rules_skipped=rules_skipped,
+        maps_inserted=maps_inserted,
+        maps_skipped=maps_skipped,
+        populate_gold_run_id=populate_gold_run_id,
     )
 
 

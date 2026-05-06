@@ -9,8 +9,12 @@ import {
   deleteUseCase,
   generateUseCases,
   commitGeneratedUseCases,
+  discoverPrograms,
+  commitDiscoveredPrograms,
   USE_CASE_STATUS_LABEL,
   USE_CASE_STATUS_ORDER,
+  type ProgramDiscoveryProposal,
+  type ProgramsDiscoverOut,
   type UseCaseCandidate,
   type UseCaseGenerateOut,
   type UseCaseLens,
@@ -38,6 +42,7 @@ import {
   DollarSign,
   Lightbulb,
   Loader2,
+  Map as MapIcon,
   Search,
   ShieldAlert,
   Sparkles,
@@ -176,6 +181,7 @@ function UseCasesPage() {
   const [lensFilter, setLensFilter] = useState<string>("__all");
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [generateOpen, setGenerateOpen] = useState(false);
+  const [discoveryOpen, setDiscoveryOpen] = useState(false);
 
   const { data: useCases, isLoading } = useQuery({
     queryKey: ["useCases"],
@@ -292,10 +298,21 @@ function UseCasesPage() {
             not yet ingested).
           </p>
         </div>
-        <Button size="lg" onClick={() => setGenerateOpen(true)}>
-          <Sparkles className="h-4 w-4 mr-2" />
-          Generate Use Cases
-        </Button>
+        <div className="flex items-center gap-2">
+          <Button
+            size="lg"
+            variant="outline"
+            onClick={() => setDiscoveryOpen(true)}
+            title="Map catalog prefixes to BHE programs and affiliates so 'ready' lens UC generation can surface real canonicals"
+          >
+            <MapIcon className="h-4 w-4 mr-2" />
+            Map programs
+          </Button>
+          <Button size="lg" onClick={() => setGenerateOpen(true)}>
+            <Sparkles className="h-4 w-4 mr-2" />
+            Generate Use Cases
+          </Button>
+        </div>
       </div>
 
       {generateOpen && (
@@ -308,6 +325,21 @@ function UseCasesPage() {
           onCommitted={() => {
             queryClient.invalidateQueries({ queryKey: ["useCases"] });
             setGenerateOpen(false);
+          }}
+        />
+      )}
+
+      {discoveryOpen && (
+        <ProgramDiscoveryDialog
+          onClose={() => setDiscoveryOpen(false)}
+          onCommitted={() => {
+            // After committing rules + maps, the affiliate -> canonicals
+            // resolution will improve once populate-gold finishes (it's
+            // auto-fired by the commit endpoint). UC list isn't directly
+            // affected, but invalidate caches that depend on the program
+            // mapping so anything reactive picks up the new state.
+            queryClient.invalidateQueries({ queryKey: ["editAffiliates"] });
+            setDiscoveryOpen(false);
           }}
         />
       )}
@@ -1333,6 +1365,314 @@ function EmptyState({ hasAny }: { hasAny: boolean }) {
           </p>
         </>
       )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Program discovery dialog.
+//
+// One-shot LLM mapping of catalog prefixes -> programs -> affiliates. Unblocks
+// `lens=ready` UC generation when the deploy starts with no `category=program`
+// rules in classification_rules.
+// ---------------------------------------------------------------------------
+
+const CONFIDENCE_BADGE: Record<string, { label: string; cls: string }> = {
+  high: { label: "high", cls: "bg-emerald-500/15 text-emerald-300 border-emerald-500/30" },
+  medium: { label: "medium", cls: "bg-amber-500/15 text-amber-300 border-amber-500/30" },
+  low: { label: "low", cls: "bg-rose-500/15 text-rose-300 border-rose-500/30" },
+};
+
+function ProgramDiscoveryDialog({
+  onClose,
+  onCommitted,
+}: {
+  onClose: () => void;
+  onCommitted: () => void;
+}) {
+  const [preview, setPreview] = useState<ProgramsDiscoverOut | null>(null);
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [topN, setTopN] = useState(25);
+
+  const discoverMut = useMutation({
+    mutationFn: () => discoverPrograms({ top_n: topN, min_schema_count: 3 }),
+    onSuccess: (data) => {
+      setPreview(data);
+      // Default-select everything HIGH confidence; let user opt-in for lower.
+      setSelected(
+        new Set(
+          data.proposals
+            .filter((p) => p.confidence === "high")
+            .map((p) => p.proposal_id),
+        ),
+      );
+    },
+    onError: (err: any) => {
+      const detail = err?.response?.data?.detail || err?.message || String(err);
+      toast.error(`Discovery failed: ${detail}`);
+    },
+  });
+
+  const commitMut = useMutation({
+    mutationFn: () =>
+      commitDiscoveredPrograms({
+        preview_id: preview!.preview_id,
+        selected_ids: Array.from(selected),
+        // Always echo the proposals back so the commit succeeds even if the
+        // in-process preview cache missed (e.g. workers > 1 split discover
+        // and commit across processes).
+        proposals: preview!.proposals,
+        run_populate_gold: true,
+      }),
+    onSuccess: (data) => {
+      const parts: string[] = [];
+      if (data.rules_inserted) parts.push(`${data.rules_inserted} rule${data.rules_inserted === 1 ? "" : "s"}`);
+      if (data.maps_inserted) parts.push(`${data.maps_inserted} mapping${data.maps_inserted === 1 ? "" : "s"}`);
+      const msg = parts.length ? `Added ${parts.join(" + ")}.` : "Nothing new added.";
+      const tail = data.populate_gold_run_id
+        ? " Re-running populate-gold in the background — refresh in ~1 minute."
+        : "";
+      toast.success(msg + tail);
+      onCommitted();
+    },
+    onError: (err: any) => {
+      const detail = err?.response?.data?.detail || err?.message || String(err);
+      toast.error(`Commit failed: ${detail}`);
+    },
+  });
+
+  // Auto-fire discover when the dialog mounts so the user lands on results,
+  // not on a blank "click here" form. Top_n is tunable via the chip below
+  // if the first pass missed something.
+  useEffect(() => {
+    if (!preview && !discoverMut.isPending && !discoverMut.isError) {
+      discoverMut.mutate();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const toggleAll = (val: boolean) => {
+    if (!preview) return;
+    setSelected(val ? new Set(preview.proposals.map((p) => p.proposal_id)) : new Set());
+  };
+
+  const togglePid = (pid: string) => {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(pid)) next.delete(pid);
+      else next.add(pid);
+      return next;
+    });
+  };
+
+  return (
+    <div
+      className="fixed inset-0 z-50 bg-black/60 flex items-center justify-center p-4"
+      onClick={onClose}
+    >
+      <div
+        className="bg-background border rounded-lg shadow-xl max-w-4xl w-full max-h-[90vh] overflow-hidden flex flex-col"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="px-6 py-4 border-b flex items-center justify-between">
+          <div>
+            <h2 className="text-lg font-semibold flex items-center gap-2">
+              <MapIcon className="h-5 w-5 text-sky-400" />
+              Map catalog prefixes to programs &amp; affiliates
+            </h2>
+            <p className="text-xs text-muted-foreground mt-1">
+              The LLM looks at the top catalog prefixes in <code>silver_schemas</code>{" "}
+              and maps them to programs and operating affiliates. Selected rows
+              are written to <code>classification_rules</code> and{" "}
+              <code>program_affiliate_map</code>; populate-gold re-runs to
+              backfill <code>silver_schemas.program</code> immediately.
+            </p>
+          </div>
+          <button onClick={onClose} className="text-muted-foreground hover:text-foreground">
+            <X className="h-5 w-5" />
+          </button>
+        </div>
+
+        <div className="flex-1 overflow-y-auto px-6 py-4">
+          {discoverMut.isPending && !preview && (
+            <div className="flex items-center justify-center py-12 text-muted-foreground">
+              <Loader2 className="h-6 w-6 mr-2 animate-spin" />
+              Asking the LLM to map your catalogs...
+            </div>
+          )}
+
+          {discoverMut.isError && !preview && (
+            <div className="text-center py-12">
+              <AlertCircle className="h-8 w-8 mx-auto text-rose-400 mb-2" />
+              <p className="text-sm text-muted-foreground mb-3">
+                Discovery failed. Check that company research and AI enrichment
+                have run.
+              </p>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => discoverMut.mutate()}
+              >
+                Retry
+              </Button>
+            </div>
+          )}
+
+          {preview && (
+            <>
+              <div className="flex items-center justify-between mb-3">
+                <div className="text-sm text-muted-foreground">
+                  {preview.proposals.length} proposals against{" "}
+                  {preview.affiliates_considered.length} affiliates
+                  {preview.company_name ? ` for ${preview.company_name}` : ""}.
+                </div>
+                <div className="flex items-center gap-2">
+                  <Button variant="ghost" size="sm" onClick={() => toggleAll(true)}>
+                    Select all
+                  </Button>
+                  <Button variant="ghost" size="sm" onClick={() => toggleAll(false)}>
+                    Clear
+                  </Button>
+                </div>
+              </div>
+
+              <div className="space-y-2">
+                {preview.proposals.map((p) => (
+                  <ProposalRow
+                    key={p.proposal_id}
+                    proposal={p}
+                    checked={selected.has(p.proposal_id)}
+                    onToggle={() => togglePid(p.proposal_id)}
+                  />
+                ))}
+              </div>
+
+              <div className="mt-4 flex items-center gap-3 text-xs text-muted-foreground">
+                <span>Want more?</span>
+                <select
+                  value={topN}
+                  onChange={(e) => setTopN(Number(e.target.value))}
+                  className="border rounded-md bg-background h-7 px-2 text-xs"
+                >
+                  <option value={10}>top 10</option>
+                  <option value={25}>top 25</option>
+                  <option value={50}>top 50</option>
+                </select>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => {
+                    setPreview(null);
+                    setSelected(new Set());
+                    discoverMut.mutate();
+                  }}
+                  disabled={discoverMut.isPending}
+                >
+                  {discoverMut.isPending ? (
+                    <Loader2 className="h-3 w-3 animate-spin" />
+                  ) : (
+                    "Re-discover"
+                  )}
+                </Button>
+              </div>
+            </>
+          )}
+        </div>
+
+        {preview && (
+          <div className="border-t px-6 py-4 flex items-center justify-between">
+            <div className="text-sm text-muted-foreground">
+              {selected.size} selected
+            </div>
+            <div className="flex items-center gap-2">
+              <Button variant="ghost" onClick={onClose}>
+                Cancel
+              </Button>
+              <Button
+                onClick={() => commitMut.mutate()}
+                disabled={selected.size === 0 || commitMut.isPending}
+              >
+                {commitMut.isPending ? (
+                  <>
+                    <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+                    Committing...
+                  </>
+                ) : (
+                  `Commit ${selected.size} mapping${selected.size === 1 ? "" : "s"}`
+                )}
+              </Button>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function ProposalRow({
+  proposal,
+  checked,
+  onToggle,
+}: {
+  proposal: ProgramDiscoveryProposal;
+  checked: boolean;
+  onToggle: () => void;
+}) {
+  const conf = CONFIDENCE_BADGE[proposal.confidence] || CONFIDENCE_BADGE.medium;
+  return (
+    <div
+      className={`border rounded-md p-3 cursor-pointer transition-colors ${
+        checked ? "border-primary/50 bg-primary/5" : "hover:bg-muted/30"
+      }`}
+      onClick={onToggle}
+    >
+      <div className="flex items-start gap-3">
+        <input
+          type="checkbox"
+          checked={checked}
+          onChange={onToggle}
+          onClick={(e) => e.stopPropagation()}
+          className="mt-1"
+        />
+        <div className="flex-1 min-w-0">
+          <div className="flex items-center gap-2 flex-wrap">
+            <code className="text-sm font-mono bg-muted/40 px-1.5 py-0.5 rounded">
+              {proposal.catalog_pattern}_*
+            </code>
+            <span className="text-muted-foreground">→</span>
+            <span className="font-medium">{proposal.program_name}</span>
+            <span className="text-muted-foreground">→</span>
+            <span className="text-sky-300">{proposal.affiliate_name}</span>
+            <Badge variant="outline" className={`ml-1 ${conf.cls}`}>
+              {conf.label}
+            </Badge>
+            <Badge variant="outline" className="text-xs">
+              {proposal.schema_count} schemas
+            </Badge>
+          </div>
+          {proposal.rationale && (
+            <p className="text-xs text-muted-foreground mt-1.5 leading-snug">
+              {proposal.rationale}
+            </p>
+          )}
+          {proposal.sample_catalogs.length > 0 && (
+            <div className="text-xs text-muted-foreground mt-1.5">
+              <span className="opacity-70">Samples:</span>{" "}
+              {proposal.sample_catalogs.slice(0, 3).map((c, i) => (
+                <code key={c} className="font-mono">
+                  {i > 0 ? ", " : ""}
+                  {c}
+                </code>
+              ))}
+              {proposal.sample_catalogs.length > 3 && (
+                <span className="opacity-70">
+                  {" "}+{proposal.sample_catalogs.length - 3} more
+                </span>
+              )}
+            </div>
+          )}
+        </div>
+      </div>
     </div>
   );
 }

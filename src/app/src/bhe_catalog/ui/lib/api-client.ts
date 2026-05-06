@@ -546,6 +546,72 @@ export async function commitGeneratedUseCases(
   return data;
 }
 
+// --- Program discovery (catalog -> program -> affiliate via LLM) ---
+
+export interface ProgramDiscoveryProposal {
+  proposal_id: string;
+  catalog_pattern: string;
+  program_name: string;
+  affiliate_name: string;
+  sample_catalogs: string[];
+  schema_count: number;
+  confidence: "high" | "medium" | "low";
+  rationale: string;
+}
+
+export interface ProgramsDiscoverOut {
+  preview_id: string;
+  proposals: ProgramDiscoveryProposal[];
+  company_name: string;
+  affiliates_considered: string[];
+  expires_at: string | null;
+}
+
+export interface ProgramsDiscoverCommitOut {
+  rules_inserted: number;
+  rules_skipped: number;
+  maps_inserted: number;
+  maps_skipped: number;
+  populate_gold_run_id: string | null;
+}
+
+export async function discoverPrograms(
+  body: { top_n?: number; min_schema_count?: number } = {},
+): Promise<ProgramsDiscoverOut> {
+  const { data } = await api.post("/programs/discover", {
+    top_n: body.top_n ?? 25,
+    min_schema_count: body.min_schema_count ?? 3,
+  });
+  return data;
+}
+
+export async function commitDiscoveredPrograms(args: {
+  preview_id: string;
+  selected_ids: string[];
+  // Optional — but the client SHOULD always send these back so the commit is
+  // robust to in-process cache misses (e.g. when the app runs with
+  // --workers > 1 and discover + commit hit different workers).
+  proposals?: ProgramDiscoveryProposal[];
+  edits?: Record<
+    string,
+    Partial<{
+      catalog_pattern: string;
+      program_name: string;
+      affiliate_name: string;
+    }>
+  >;
+  run_populate_gold?: boolean;
+}): Promise<ProgramsDiscoverCommitOut> {
+  const { data } = await api.post("/programs/discover/commit", {
+    preview_id: args.preview_id,
+    selected_ids: args.selected_ids,
+    proposals: args.proposals ?? [],
+    edits: args.edits ?? {},
+    run_populate_gold: args.run_populate_gold ?? true,
+  });
+  return data;
+}
+
 export async function fetchEntities(params?: {
   use_case_name?: string;
   matched_only?: boolean;
