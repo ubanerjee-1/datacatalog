@@ -12,11 +12,14 @@ makes the Sankey unusable.
 
 Pipeline (5 stages, each individually tagged + idempotent)
 ----------------------------------------------------------
-1. seed_canonical
-   Upserts source_system_canonical and source_system_aliases from the
-   bundled CSV (src/data/source_system_canonical_seed.csv). Customer
-   edits to the seed CSV propagate on next run; manual edits to the
-   alias table (mapped_by='manual') are NEVER overwritten.
+1. derive_canonical (LLM)
+   Generates source_system_canonical + the seed/alias_seed rows of
+   source_system_aliases from (a) the company industry/profile and
+   (b) the distinct raw values currently in silver_tables.source_system
+   (refines the list as more data is enriched). Closes B-003 — the
+   bundled `source_system_canonical_seed.csv` was retired in 2026-05-05.
+   Manual edits (mapped_by='manual' or is_user_edited=true) are NEVER
+   overwritten.
 
 2. extract_unmapped
    Selects every distinct silver_tables.source_system that is not yet
@@ -47,11 +50,13 @@ CLI
     --catalog                  default your_catalog
     --silver-schema            default bhe_silver
     --gold-schema              default bhe_gold
-    --seed-csv                 default <bundle>/src/data/source_system_canonical_seed.csv
-    --reseed-aliases           re-import alias rows from seed CSV (idempotent)
+    --reseed-aliases           re-derive seed/alias_seed alias rows from
+                                the LLM (manual edits always preserved)
     --remap-other              re-evaluate raws currently mapped to 'Other'
                                 (use after expanding the canonical list)
-    --skip-llm                 skip stage 4 (deterministic only)
+    --skip-llm                 skip stage 4 (deterministic only). Stage 1
+                                always runs because downstream stages
+                                depend on the canonical list existing.
     --llm-endpoint             default databricks-claude-sonnet-4
 
 Re-run safety
@@ -61,12 +66,10 @@ Idempotent. Manual edits (mapped_by='manual') are preserved across runs.
 from __future__ import annotations
 
 import argparse
-import csv
 import logging
 import os
 import sys
 import time
-from typing import Iterable
 
 from pyspark.sql import SparkSession
 
@@ -90,56 +93,162 @@ DEFAULT_LLM_ENDPOINT = "databricks-claude-sonnet-4"
 
 
 # =====================================================================
-# Stage 1: seed canonical + aliases from the bundled CSV
+# Stage 1: derive canonical + aliases via LLM
+#
+# Closes B-003 (source_system_canonical_seed.csv portion). Replaces the
+# bundled CSV seed path with an LLM-driven generator that uses:
+#   (a) the company industry / business description from
+#       bhe_silver.company_profile (always present after company
+#       research), and
+#   (b) the distinct raw values seen in bhe_silver.silver_tables (used
+#       as a hint when present — empty on a fresh deploy, populated
+#       after AI table enrichment runs at least once).
+#
+# Same is_user_edited / mapped_by='manual' preservation contract as the
+# old CSV-seed flow: rerunning this stage NEVER overwrites a row a human
+# touched in the Edit Center.
 # =====================================================================
-def _resolve_seed_csv(explicit: str) -> str:
-    """Find the seed CSV. Bundle layout puts it next to src/jobs/."""
-    if explicit:
-        return explicit
-    # bundle: <root>/src/jobs/normalize_source_systems.py
-    # seed:   <root>/src/data/source_system_canonical_seed.csv
-    candidates = [
-        os.path.join(os.path.dirname(_here), "data",
-                     "source_system_canonical_seed.csv"),
-        # Fallback: cwd-relative for local dev.
-        os.path.join(os.getcwd(), "src", "data",
-                     "source_system_canonical_seed.csv"),
-    ]
-    for p in candidates:
-        if os.path.exists(p):
-            return p
-    raise FileNotFoundError(
-        "Could not locate source_system_canonical_seed.csv in: "
-        + ", ".join(candidates)
+def _sql_str(s: str) -> str:
+    return "'" + (s or "").replace("'", "''") + "'"
+
+
+def _load_industry_context(spark: SparkSession, *, catalog: str,
+                           silver: str) -> dict:
+    """Pull a small profile blob from bhe_silver.company_profile.
+
+    Returns {} when the table doesn't exist or is empty (greenfield
+    deploy). The LLM falls back to a generic enterprise vocabulary
+    in that case — still useful, just less targeted.
+
+    Schema reference (must stay in sync with the company-research
+    wizard's writer in router.py):
+        id, company_name, industry, sub_industry, description,
+        headquarters, key_business_units, strategic_priorities,
+        regulatory_environment, catalog_name, logo_url, primary_domain,
+        branding_user_edited
+    """
+    profile_tbl = f"`{catalog}`.`{silver}`.`company_profile`"
+    try:
+        rows = spark.sql(tagged_sql(f"""
+            SELECT
+                COALESCE(company_name, '')           AS company_name,
+                COALESCE(industry, '')               AS industry,
+                COALESCE(sub_industry, '')           AS sub_industry,
+                COALESCE(description, '')            AS description,
+                COALESCE(regulatory_environment, '') AS regulatory_environment
+            FROM {profile_tbl}
+            LIMIT 1
+        """, module=MODULE, submodule="llm_canonical_profile")).collect()
+        if not rows:
+            return {}
+        r = rows[0]
+        return {
+            "company_name": r["company_name"],
+            "industry": r["industry"],
+            "sub_industry": r["sub_industry"],
+            "description": r["description"],
+            "regulatory_environment": r["regulatory_environment"],
+        }
+    except Exception as e:
+        logger.warning(f"Could not load company profile (using generic prompt): {e}")
+        return {}
+
+
+def _load_silver_raw_hints(spark: SparkSession, *, catalog: str,
+                           silver: str, limit: int = 200) -> list[str]:
+    """Pull up to `limit` distinct raw source_system values from silver_tables.
+
+    Returns [] when the column doesn't exist yet (pre-enrichment) or
+    silver_tables is empty (pre-ingest). This is a HINT to the LLM, not
+    a hard input, so empty is fine.
+    """
+    silver_tbl = f"`{catalog}`.`{silver}`.`silver_tables`"
+    try:
+        rows = spark.sql(tagged_sql(f"""
+            SELECT DISTINCT TRIM(source_system) AS raw
+            FROM {silver_tbl}
+            WHERE COALESCE(source_system, '') != ''
+            ORDER BY raw
+            LIMIT {int(limit)}
+        """, module=MODULE, submodule="llm_canonical_hints")).collect()
+        return [r["raw"] for r in rows if r["raw"]]
+    except Exception as e:
+        # Most common cause: silver_tables.source_system column missing
+        # because ai_enrich_tables hasn't run yet on a fresh deploy.
+        logger.info(f"No raw hints from silver_tables ({e}); LLM will rely on industry only.")
+        return []
+
+
+def _build_canonical_prompt(profile: dict, raw_hints: list[str]) -> str:
+    """Build the prompt for ai_query()."""
+    industry = profile.get("industry") or "general enterprise"
+    sub_industry = profile.get("sub_industry") or ""
+    company = profile.get("company_name") or "the customer"
+    desc = profile.get("description") or ""
+    regulatory = profile.get("regulatory_environment") or ""
+
+    # Surface sub-industry in the industry line ("Energy / Electric Utility")
+    # so the LLM keys on it. Without sub_industry, "Energy" alone could
+    # produce O&G or renewables-only systems and miss CIS/SCADA/EAM.
+    industry_line = industry + (f" ({sub_industry})" if sub_industry else "")
+
+    hint_block = ""
+    if raw_hints:
+        sample = raw_hints[:80]
+        hint_block = (
+            "\n\nThe data catalog already contains the following distinct "
+            "raw source-system labels (these are noisy LLM-generated labels "
+            "from individual table inspection — use them as HINTS to ground "
+            "the canonical list, but de-duplicate aggressively. e.g. "
+            "'PI Historian', 'OSIsoft PI', 'AVEVA PI' are all the same "
+            "canonical 'PI Historian'):\n- "
+            + "\n- ".join(sample)
+        )
+
+    return (
+        f"You are building the canonical source-system vocabulary for a data "
+        f"catalog at {company}, a company in the {industry_line} industry.\n\n"
+        f"Company description: {desc}\n"
+        + (f"Regulatory environment: {regulatory}\n\n" if regulatory else "\n")
+        + "Task: produce a list of 30-80 canonical source systems that this "
+        "company most likely operates, including ERP, CRM, billing/CIS, EAM, "
+        "historian/SCADA, GIS, document management, HRIS, financial planning, "
+        "data warehouse, and other category-defining systems typical for the "
+        "industry. Include common per-platform variants (e.g. 'SAP ECC' and "
+        "'SAP S/4HANA' as separate canonicals)."
+        + hint_block
+        + "\n\nRules:\n"
+        "1. Each canonical must be a SHORT, RECOGNIZABLE product name "
+        "(e.g. 'SAP ECC', 'Maximo', 'PI Historian', 'Salesforce', "
+        "'ServiceNow') — NOT a category description.\n"
+        "2. Aliases are alternate spellings/marketing names/version "
+        "suffixes for the same product (e.g. canonical='PI Historian' "
+        "aliases=['OSIsoft PI', 'AVEVA PI', 'PI System']).\n"
+        "3. Categories: pick from this closed list — "
+        "{ERP, CRM, EAM, CIS, Historian, SCADA, GIS, HRIS, FP&A, "
+        "Document, DataWarehouse, DataLake, BI, ITSM, MDM, Other}.\n"
+        "4. Descriptions: 1 sentence, plain English.\n"
+        "5. NO duplicates: each canonical MUST be unique.\n"
+        "6. Return JSON ONLY, no prose, no fenced code block, no "
+        "leading/trailing commentary.\n\n"
+        "Return JSON with EXACTLY this shape (the top-level key MUST be "
+        "\"canonicals\"; do NOT invent other keys):\n"
+        "{\n"
+        '  "canonicals": [\n'
+        '    {"canonical": "SAP ECC", "category": "ERP", '
+        '"description": "On-prem SAP ERP suite for finance, supply chain, and HR.", '
+        '"aliases": ["SAP", "SAP R/3", "SAP ERP"]},\n'
+        '    {"canonical": "Maximo", "category": "EAM", '
+        '"description": "IBM enterprise asset management platform.", '
+        '"aliases": ["IBM Maximo", "Maximo Asset Management"]}\n'
+        "  ]\n"
+        "}"
     )
 
 
-def _read_seed(csv_path: str) -> list[dict]:
-    rows = []
-    with open(csv_path, newline="", encoding="utf-8") as f:
-        for r in csv.DictReader(f):
-            canonical = (r.get("canonical") or "").strip()
-            if not canonical:
-                continue
-            raw_aliases = (r.get("aliases") or "").strip()
-            aliases = [
-                a.strip() for a in raw_aliases.split("|") if a.strip()
-            ] if raw_aliases else []
-            rows.append({
-                "canonical": canonical,
-                "category": (r.get("category") or "").strip(),
-                "description": (r.get("description") or "").strip(),
-                "aliases": aliases,
-            })
-    return rows
-
-
-def _sql_str(s: str) -> str:
-    return "'" + s.replace("'", "''") + "'"
-
-
-def stage_seed_canonical(spark: SparkSession, *, catalog: str, gold: str,
-                         seed_csv: str, reseed_aliases: bool) -> None:
+def stage_llm_canonical(spark: SparkSession, *, catalog: str, silver: str,
+                        gold: str, llm_endpoint: str,
+                        reseed_aliases: bool) -> None:
     canonical_tbl = f"`{catalog}`.`{gold}`.`source_system_canonical`"
     alias_tbl = f"`{catalog}`.`{gold}`.`source_system_aliases`"
 
@@ -154,7 +263,7 @@ def stage_seed_canonical(spark: SparkSession, *, catalog: str, gold: str,
                 updated_at  TIMESTAMP
             )
             USING DELTA
-            COMMENT 'Customer-editable canonical list of source systems. Seeded from src/data/source_system_canonical_seed.csv on every job run; manual edits survive.'
+            COMMENT 'Customer-editable canonical list of source systems. LLM-derived from company industry + observed raw values; manual edits survive subsequent re-runs.'
         """, module=MODULE, submodule="seed_canonical_ddl"))
 
         spark.sql(tagged_sql(f"""
@@ -218,16 +327,94 @@ def stage_seed_canonical(spark: SparkSession, *, catalog: str, gold: str,
                     f"({n_before} -> {n_after})."
                 )
 
-    seed_rows = _read_seed(seed_csv)
-    logger.info(f"Loaded {len(seed_rows)} canonical entries from {seed_csv}")
+    # Short-circuit: if the canonical table already has rows AND we're
+    # not in --reseed-aliases mode, skip the LLM call. The downstream
+    # stages will use the existing list. Saves one LLM round-trip per
+    # job run after first deploy.
+    existing_canon = spark.sql(tagged_sql(
+        f"SELECT COUNT(*) AS c FROM {canonical_tbl}",
+        module=MODULE, submodule="seed_canonical_check",
+    )).collect()[0]["c"]
+    if existing_canon > 0 and not reseed_aliases:
+        logger.info(f"Stage 1: canonical already has {existing_canon} rows; "
+                    "skipping LLM (use --reseed-aliases to refresh).")
+        return
 
-    # Build VALUES for canonical upsert.
+    profile = _load_industry_context(spark, catalog=catalog, silver=silver)
+    raw_hints = _load_silver_raw_hints(spark, catalog=catalog, silver=silver)
+    prompt = _build_canonical_prompt(profile, raw_hints)
+    response_schema = (
+        "canonicals ARRAY<STRUCT<canonical:STRING, category:STRING, "
+        "description:STRING, aliases:ARRAY<STRING>>>"
+    )
+
+    with tag_block(spark, module=MODULE, submodule="llm_canonical_query"):
+        t0 = time.time()
+        spark.sql(tagged_sql(f"""
+            CREATE OR REPLACE TEMPORARY VIEW _canon_llm AS
+            SELECT ai_query(
+                       {_sql_str(llm_endpoint)},
+                       {_sql_str(prompt)},
+                       failOnError => false,
+                       modelParameters => named_struct(
+                           'max_tokens', 8000,
+                           'temperature', 0.0
+                       )
+                   ) AS resp
+        """, module=MODULE, submodule="llm_canonical_query"))
+        logger.info(f"Stage 1: LLM canonical query finished in {time.time()-t0:.1f}s")
+
+    parsed = spark.sql(tagged_sql(f"""
+        WITH cleaned AS (
+            SELECT regexp_replace(
+                       regexp_replace(resp.result, '^```\\\\w*\\\\n?', ''),
+                       '\\\\n?```$', ''
+                   ) AS clean_json
+            FROM _canon_llm
+            WHERE resp.result IS NOT NULL
+        )
+        SELECT from_json(TRIM(clean_json), {_sql_str(response_schema)}) AS p
+        FROM cleaned
+    """, module=MODULE, submodule="llm_canonical_parse")).collect()
+
+    if not parsed or parsed[0]["p"] is None:
+        logger.error("Stage 1: LLM returned no parseable canonical list. "
+                     "Aborting (downstream stages need this).")
+        return
+
+    raw_canonicals = parsed[0]["p"]["canonicals"] or []
+    # Dedup canonicals + aliases by lowercased name. Canonical self-map
+    # always wins; alias_seed loses to a canonical sharing the same key.
+    seen_norm: set[str] = set()
+    seed_rows: list[dict] = []
+    for c in raw_canonicals:
+        canonical = (c["canonical"] or "").strip()
+        if not canonical:
+            continue
+        key = canonical.lower().strip()
+        if key in seen_norm:
+            continue
+        seen_norm.add(key)
+        seed_rows.append({
+            "canonical": canonical,
+            "category": (c["category"] or "Other").strip(),
+            "description": (c["description"] or "").strip(),
+            "aliases": [a.strip() for a in (c["aliases"] or []) if a and a.strip()],
+        })
+
+    if not seed_rows:
+        logger.error("Stage 1: LLM returned 0 valid canonicals after dedup. "
+                     "Aborting.")
+        return
+    logger.info(f"Stage 1: LLM produced {len(seed_rows)} canonicals "
+                f"(industry={profile.get('industry') or 'unknown'}, "
+                f"raw_hints={len(raw_hints)})")
+
     canonical_values = ",\n".join(
         f"({_sql_str(r['canonical'])}, {_sql_str(r['category'])}, "
         f"{_sql_str(r['description'])}, true, current_timestamp(), current_timestamp())"
         for r in seed_rows
     )
-
     with tag_block(spark, module=MODULE, submodule="seed_canonical_merge"):
         spark.sql(tagged_sql(f"""
             MERGE INTO {canonical_tbl} AS target
@@ -246,41 +433,37 @@ def stage_seed_canonical(spark: SparkSession, *, catalog: str, gold: str,
             WHEN NOT MATCHED THEN INSERT *
         """, module=MODULE, submodule="seed_canonical_merge"))
 
-    # Self-mapping: every canonical maps to itself (mapped_by='seed').
-    # Plus alias mappings from the CSV (mapped_by='alias_seed').
-    # Manual-edited rows are never overwritten.
-    # Dedup seed aliases by raw_normalized; canonical self-mapping always
-    # wins over alias_seed if both share a normalized form.
+    # Self-map every canonical to itself (mapped_by='seed') and add
+    # alias entries (mapped_by='alias_seed') from the LLM-emitted alias
+    # arrays. Dedup by raw_normalized; canonical self-mapping wins ties.
     alias_rows: list[tuple[str, str, str]] = []
-    seen_norm: set[str] = set()
+    seen_alias_norm: set[str] = set()
     for r in seed_rows:
         key = r["canonical"].lower().strip()
-        if key not in seen_norm:
+        if key not in seen_alias_norm:
             alias_rows.append((r["canonical"], r["canonical"], "seed"))
-            seen_norm.add(key)
+            seen_alias_norm.add(key)
     for r in seed_rows:
         for a in r["aliases"]:
             key = a.lower().strip()
-            if key in seen_norm:
+            if not key or key in seen_alias_norm:
                 continue
             alias_rows.append((a, r["canonical"], "alias_seed"))
-            seen_norm.add(key)
+            seen_alias_norm.add(key)
 
     if reseed_aliases:
-        logger.info(
-            f"--reseed-aliases set: will overwrite non-manual alias rows."
-        )
+        logger.info("--reseed-aliases set: overwriting non-manual alias rows.")
     alias_values = ",\n".join(
         f"({_sql_str(raw)}, {_sql_str(raw.lower().strip())}, "
         f"{_sql_str(canon)}, {_sql_str(by)}, "
         f"'high', current_timestamp(), false)"
         for raw, canon, by in alias_rows
     )
-    # --reseed-aliases precedence: CSV is the source of truth for
-    # anything that wasn't manually edited. Overrides llm/fallback_other
-    # mappings so expanding the CSV actually pulls raws out of 'Other'.
-    # Manual edits (is_user_edited=true or mapped_by='manual') are
-    # NEVER overwritten.
+    # --reseed-aliases precedence: when set, the freshly-derived list is
+    # source of truth for anything not manually edited. Overrides
+    # llm/fallback_other mappings so a refreshed canonical list pulls
+    # raws out of 'Other'. Manual edits (is_user_edited=true or
+    # mapped_by='manual') are NEVER overwritten.
     update_clause = (
         "WHEN MATCHED AND target.is_user_edited = false "
         "AND target.mapped_by NOT IN ('manual') THEN UPDATE SET "
@@ -672,24 +855,32 @@ def main():
     parser.add_argument("--catalog", default="your_catalog")
     parser.add_argument("--silver-schema", default="bhe_silver")
     parser.add_argument("--gold-schema", default="bhe_gold")
-    parser.add_argument("--seed-csv", default="",
-                        help="Path to canonical seed CSV. Empty = auto-locate "
-                             "next to the bundle.")
+    # `--seed-csv` retired in favor of LLM-driven canonical generation
+    # (B-003 closure). Kept as a hidden no-op so existing job
+    # configurations don't fail on `unrecognized argument` after a
+    # bundle redeploy. New callers should drop the flag.
+    parser.add_argument("--seed-csv", default="", help=argparse.SUPPRESS)
     parser.add_argument("--reseed-aliases", action="store_true",
-                        help="Refresh seed/alias_seed alias rows from CSV "
-                             "(manual edits always preserved).")
+                        help="Re-derive seed/alias_seed alias rows from the "
+                             "LLM (manual edits always preserved). Use after "
+                             "AI table enrichment has populated more raw "
+                             "source-system labels and you want a tighter list.")
     parser.add_argument("--remap-other", action="store_true",
                         help="Re-evaluate raws currently mapped to 'Other'. "
                              "Use after expanding the canonical list.")
     parser.add_argument("--skip-llm", action="store_true",
-                        help="Skip the LLM fallback stage (deterministic only).")
+                        help="Skip the long-tail LLM fallback (stage 4). "
+                             "Stage 1 (canonical generation) always runs.")
     parser.add_argument("--llm-endpoint", default=DEFAULT_LLM_ENDPOINT)
     args = parser.parse_args()
 
+    if args.seed_csv:
+        logger.warning("--seed-csv is deprecated and ignored (B-003 closure). "
+                       "source_system_canonical is now LLM-derived from "
+                       "company_profile + silver_tables raw values.")
+
     spark = SparkSession.builder.getOrCreate()
 
-    seed_csv = _resolve_seed_csv(args.seed_csv)
-    logger.info(f"Seed CSV:        {seed_csv}")
     logger.info(f"Catalog/silver:  {args.catalog}.{args.silver_schema}")
     logger.info(f"Catalog/gold:    {args.catalog}.{args.gold_schema}")
     logger.info(f"LLM endpoint:    {args.llm_endpoint}")
@@ -697,13 +888,14 @@ def main():
     logger.info(f"Remap 'Other':   {args.remap_other}")
 
     logger.info("=" * 60)
-    logger.info("Stage 1: seed canonical + aliases from CSV")
+    logger.info("Stage 1: derive canonical + seed aliases via LLM")
     logger.info("=" * 60)
-    stage_seed_canonical(
+    stage_llm_canonical(
         spark,
         catalog=args.catalog,
+        silver=args.silver_schema,
         gold=args.gold_schema,
-        seed_csv=seed_csv,
+        llm_endpoint=args.llm_endpoint,
         reseed_aliases=args.reseed_aliases,
     )
 

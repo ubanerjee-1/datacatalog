@@ -210,6 +210,15 @@ class UseCaseOut(BaseModel):
     status_notes: str = ""
     status_updated_at: Optional[str] = None
     is_user_edited: bool = False
+    # PR 2 generation lens fields. NULL on rows created before the
+    # generator was wired up (chat-create + bulk company_research),
+    # which the UI renders as "manual" lens / no extra badges.
+    affiliate: Optional[str] = None
+    lens: Optional[str] = None
+    time_horizon: Optional[str] = None
+    value_type: Optional[str] = None
+    is_regulatory: Optional[bool] = None
+    required_canonicals: list[str] = Field(default_factory=list)
 
 
 class UseCaseUpdateIn(BaseModel):
@@ -248,6 +257,86 @@ class UseCaseStatusIn(BaseModel):
     """
     status: str
     status_notes: Optional[str] = None
+
+
+# --- Structured Use Case generation (PR 2 of UC redesign) ---
+# These models drive the on-demand generator on the new /use-cases page.
+# Generation is decoupled from `company_research` (which stays as the bulk
+# day-zero seeder) so users can iterate on individual (affiliate, dept, lens)
+# slices without re-running the whole research pipeline.
+
+class UseCaseGenerateIn(BaseModel):
+    """Request body for ``POST /api/use-cases/generate`` (dry-run preview).
+
+    The result is cached in-process keyed by a returned ``preview_id`` so the
+    user can review/edit the candidates before committing — see
+    ``UseCaseGenerateCommitIn``. This avoids paying for the LLM twice.
+    """
+    affiliate: str
+    department: str
+    count: int = 5  # 1..20
+    lens: str = "ready"  # ready | gap | both
+    # Optional steering. ``any`` = no bias (default; LLM picks balanced mix).
+    time_horizon: str = "any"  # any | quick_win | strategic
+    value_type: str = "any"    # any | cost | revenue | risk
+    prioritize_regulatory: bool = False
+    # When ``None`` the backend uses canonicals already mapped to the
+    # affiliate via the program -> affiliate -> tables join. When provided,
+    # the explicit list overrides discovery (still validated against
+    # ``gold.source_system_canonical``).
+    canonical_filter: Optional[list[str]] = None
+
+
+class UseCaseCandidate(BaseModel):
+    """A single LLM-proposed use case, before it lands in `silver.use_cases`.
+
+    The ``candidate_id`` is a stable hash of ``(name, affiliate, department)``
+    so the commit step can reference candidates without echoing the whole
+    payload, and so re-running the same generation won't yield duplicates
+    once committed.
+    """
+    candidate_id: str
+    use_case_name: str
+    description: str = ""
+    department: str = ""
+    affiliate: str = ""
+    business_value: str = ""
+    estimated_value_usd: Optional[float] = None
+    value_rationale: str = ""
+    priority: str = "Medium"
+    category: str = ""
+    lens: str = "ready"  # ready | gap
+    time_horizon: Optional[str] = None
+    value_type: Optional[str] = None
+    is_regulatory: bool = False
+    data_requirements: list[str] = Field(default_factory=list)
+    required_canonicals: list[str] = Field(default_factory=list)
+
+
+class UseCaseGenerateOut(BaseModel):
+    """Preview response. ``preview_id`` is short-lived (~10 minutes)."""
+    preview_id: str
+    affiliate: str
+    department: str
+    lens: str
+    candidates: list[UseCaseCandidate]
+    # Surfaces context the LLM used so the UI can show provenance:
+    canonicals_present: list[str] = Field(default_factory=list)
+    canonicals_missing: list[str] = Field(default_factory=list)
+    table_sample_count: int = 0
+    expires_at: Optional[str] = None
+
+
+class UseCaseGenerateCommitIn(BaseModel):
+    """Persist a subset of a previewed batch into ``silver.use_cases``."""
+    preview_id: str
+    selected_ids: list[str] = Field(default_factory=list)
+
+
+class UseCaseGenerateCommitOut(BaseModel):
+    inserted: int
+    skipped: int
+    use_case_ids: list[str] = Field(default_factory=list)
 
 
 # --- Edit Center: bhe_gold dimension tables ---

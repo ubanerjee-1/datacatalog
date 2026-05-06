@@ -85,9 +85,17 @@ filtered AS (
     )
     AND lower(schema_name) NOT IN ('information_schema', 'default')
 ),
+counted AS (
+  -- workspace_count is computed BEFORE dedup so it reflects the true
+  -- number of distinct workspaces that saw this (catalog, schema) in
+  -- the bronze extract.
+  SELECT *,
+         COUNT(*) OVER (PARTITION BY catalog_name, schema_name) AS workspace_count
+  FROM filtered
+),
 deduped AS (
   SELECT *
-  FROM filtered
+  FROM counted
   QUALIFY ROW_NUMBER() OVER (
     PARTITION BY catalog_name, schema_name
     ORDER BY last_altered DESC NULLS LAST, created DESC NULLS LAST
@@ -101,6 +109,7 @@ SELECT
   COALESCE(created, '') AS created,
   COALESCE(last_altered, '') AS last_altered,
   COALESCE(workspace_url, '') AS workspace_url,
+  workspace_count,
   CASE
     WHEN lower(catalog_name) RLIKE '_dev[0-9]{{2}}_' THEN 'DEV'
     WHEN lower(catalog_name) RLIKE '_qa[0-9]{{2}}_' THEN 'QA'
@@ -120,18 +129,13 @@ SELECT
     WHEN lower(catalog_name) LIKE '%oracle%' OR lower(catalog_name) LIKE '%sqlserver%' THEN 'FEDERATED'
     ELSE 'OTHER'
   END AS zone,
-  CASE
-    WHEN lower(catalog_name) LIKE 'apm_%' THEN 'Asset Performance Management'
-    WHEN lower(catalog_name) LIKE 'bhermred_%' THEN 'BHE Renewable Energy'
-    WHEN lower(catalog_name) LIKE 'fdm_%' THEN 'Financial Data Management'
-    WHEN lower(catalog_name) LIKE 'gtsdl_%' THEN 'GTS Data Lake'
-    WHEN lower(catalog_name) LIKE 'nvedl_%' THEN 'NV Energy Data Lake'
-    WHEN lower(catalog_name) LIKE 'pac_%' THEN 'PacifiCorp'
-    WHEN lower(catalog_name) LIKE 'pacmdl_%' THEN 'PacifiCorp Model'
-    WHEN lower(catalog_name) LIKE 'trp_%' THEN 'Transmission & Reliability Planning'
-    WHEN lower(catalog_name) LIKE 'whub_%' THEN 'Western Hub'
-    ELSE 'Unknown'
-  END AS program,
+  -- Program is intentionally NOT hardcoded here (closes circular dep E,
+  -- 2026-05-05). The label is derived by populate_gold from the editable
+  -- `bhe_gold.classification_rules` table and backfilled into
+  -- silver_schemas at the end of populate_gold. Until populate_gold runs
+  -- (or for catalogs unmatched by any rule), rows show 'Unknown'. Same
+  -- rationale lives in the `ingest_schemas` MERGE in router.py.
+  CAST('Unknown' AS STRING) AS program,
   CASE
     WHEN lower(schema_name) LIKE '%test%' OR lower(schema_name) LIKE '%poc%' THEN 'TEST'
     WHEN lower(schema_name) LIKE 'wflw_%' THEN 'MIGRATION'
@@ -180,9 +184,19 @@ filtered AS (
     )
     AND lower(table_schema) NOT IN ('information_schema', 'default')
 ),
+counted AS (
+  -- workspace_count is computed BEFORE dedup so it reflects the true
+  -- number of distinct workspaces that saw this (catalog, schema, table)
+  -- in the bronze extract.
+  SELECT *,
+         COUNT(*) OVER (
+           PARTITION BY table_catalog, table_schema, table_name
+         ) AS workspace_count
+  FROM filtered
+),
 deduped AS (
   SELECT *
-  FROM filtered
+  FROM counted
   QUALIFY ROW_NUMBER() OVER (
     PARTITION BY table_catalog, table_schema, table_name
     ORDER BY last_altered DESC NULLS LAST, created DESC NULLS LAST
@@ -198,6 +212,7 @@ SELECT
   COALESCE(created, '') AS created,
   COALESCE(last_altered, '') AS last_altered,
   COALESCE(data_source_format, '') AS data_source_format,
+  workspace_count,
   'PRODUCTION' AS classification,
   '' AS ai_definition,
   '' AS business_friendly_name,
@@ -222,12 +237,36 @@ for tbl, ddl in [
         key_functions STRING, data_needs STRING, company_name STRING,
         is_user_edited BOOLEAN
     ) USING DELTA"""),
+    # `use_cases` carries three waves of columns:
+    #   1. Core seed (chat / company_research / Edit Center): id..is_user_edited
+    #   2. Delivery lifecycle (Value & Readiness): status, status_notes,
+    #      status_updated_at, created_at — used by the inline-thread
+    #      `insert_use_case_row` path and the status PATCH endpoint.
+    #   3. Generation lens (PR 2 of UC redesign — `/use-cases` page):
+    #      affiliate, lens, time_horizon, value_type, is_regulatory,
+    #      required_canonicals, generated_at, generated_by.
+    # All three are baked into bootstrap so a fresh deploy never has to run
+    # `_ensure_use_case_status_columns()`'s defensive ALTER. The helper only
+    # exists for already-deployed environments (e.g. UB_TEST) that pre-date
+    # PR 2 and need to catch up in place.
     ("use_cases", """CREATE TABLE IF NOT EXISTS {fqn} (
         id STRING, use_case_name STRING, description STRING,
         department STRING, category STRING, business_value STRING,
         estimated_value_usd DOUBLE, value_rationale STRING,
         data_requirements STRING, priority STRING, company_name STRING,
-        is_user_edited BOOLEAN
+        is_user_edited BOOLEAN,
+        status STRING COMMENT 'Delivery lifecycle: not_started|in_progress|delivered|on_hold',
+        status_notes STRING,
+        status_updated_at TIMESTAMP,
+        created_at TIMESTAMP,
+        affiliate STRING,
+        lens STRING COMMENT 'ready|gap|manual',
+        time_horizon STRING COMMENT 'quick_win|strategic|NULL',
+        value_type STRING COMMENT 'cost|revenue|risk|mixed|NULL',
+        is_regulatory BOOLEAN,
+        required_canonicals STRING COMMENT 'JSON array of canonical source names',
+        generated_at TIMESTAMP,
+        generated_by STRING COMMENT 'llm endpoint id, or "chat" for free-form'
     ) USING DELTA"""),
     ("use_case_entities", """CREATE TABLE IF NOT EXISTS {fqn} (
         entity_id STRING, use_case_id STRING, use_case_name STRING,
@@ -373,7 +412,7 @@ _TABLE_COMMENTS: dict[str, str] = {
 
 _COLUMN_COMMENTS: dict[str, dict[str, str]] = {
     "silver_tables": {
-        "table_catalog": "Unity Catalog name (e.g., pac_prod_apm, nvedl_dev_standardized).",
+        "table_catalog": "Unity Catalog name (e.g., my_program_prod_published).",
         "table_schema": "Schema name within the catalog.",
         "table_name": "Table or view name.",
         "table_type": "MANAGED, EXTERNAL, VIEW, MATERIALIZED_VIEW, etc. (from information_schema).",

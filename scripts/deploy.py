@@ -560,6 +560,98 @@ def grant_uc(catalog: str, sp_id: str, profile: str, schemas: dict[str, list[str
         )
 
 
+# Bundle-deployed jobs the app must be able to discover + run via
+# `db.jobs.list()` and `db.jobs.run_now()` — the substrings in
+# router.py's `_find_databricks_job(name_match)` calls.
+#
+# Without an explicit grant, the bundle deploy gives CAN_MANAGE only to
+# the deployer + workspace admins. The app's service principal then can't
+# see the jobs in `/api/2.1/jobs/list`, so the wizard's Step 7 cards
+# (Source-System Normalization, Value Model Build, Glossary Builder)
+# return `404 Databricks job containing 'X' not found`.
+#
+# Caught by E2E on ub_test 2026-05-05 (B-025). Manual workaround was
+# `databricks api patch /api/2.0/permissions/jobs/{id}` per job; this
+# function bakes that in so future deploys are turn-key.
+_BUNDLE_JOB_NAME_MATCHES = [
+    "BHE Source-System Normalization",
+    "BHE Value Model Build",
+    "BHE Glossary Builder",
+    "BHE AI Table Enrichment",
+    # NOTE: "BHE Company Research" intentionally NOT listed here. The bundle
+    # resource was removed in favor of the inline FastAPI path
+    # (_run_company_research in router.py) which is the single source of
+    # truth aligned with the current 3-step model (profile, departments,
+    # affiliates). The standalone src/jobs/company_research.py was deleted
+    # — it had drifted to a stale 5-step contract (profile, departments,
+    # usecases, entities, sankey) and caused INSUFFICIENT_PERMISSIONS-style
+    # failures on the bundle path before being retired.
+]
+
+
+def _find_bundle_job_id(name_match: str, target: str, profile: str) -> str | None:
+    """Locate a bundle-deployed job by name substring AND target tag.
+
+    Bundle jobs are named like `[dev] BHE Source-System Normalization` for
+    the `dev` target. We require both substrings so the helper picks the
+    right one when multiple bundle targets share a workspace (e.g. `[dev]`
+    and `[e2e]` both deployed concurrently).
+    """
+    # The Databricks CLI's `api get` doesn't accept a separate query-string
+    # flag; query params have to be embedded in the path. limit=100 is more
+    # than enough for any reasonable BHE workspace (we only deploy ~5 jobs)
+    # but covers shared workspaces where other bundles also live.
+    out = run(
+        ["databricks", "api", "get", "/api/2.1/jobs/list?limit=100",
+         "-p", profile],
+        capture=True,
+    )
+    try:
+        data = json.loads(out.stdout or "{}")
+    except Exception as e:
+        warn(f"could not parse jobs list output: {e}")
+        return None
+    target_tag = f"[{target}]"
+    for j in data.get("jobs", []) or []:
+        name = (j.get("settings") or {}).get("name", "")
+        if name_match in name and target_tag in name:
+            return str(j.get("job_id"))
+    return None
+
+
+def grant_jobs(sp_id: str, profile: str, target: str) -> None:
+    """Idempotent CAN_MANAGE_RUN grant on bundle jobs for the app SP (B-025).
+
+    Mirrors how `grant_uc` makes the app's UC privileges turn-key. The
+    permissions API uses PATCH semantics for `access_control_list` so this
+    is safe to re-run — it adds the SP entry without disturbing existing
+    ACLs (deployer-as-owner, admins-as-CAN_MANAGE).
+    """
+    info("granting CAN_MANAGE_RUN on bundle jobs to the app service principal")
+    granted = 0
+    for name_match in _BUNDLE_JOB_NAME_MATCHES:
+        job_id = _find_bundle_job_id(name_match, target, profile)
+        if not job_id:
+            warn(f"bundle job '{name_match}' not found for target '{target}' — skipping")
+            continue
+        run(
+            [
+                "databricks", "api", "patch",
+                f"/api/2.0/permissions/jobs/{job_id}",
+                "-p", profile,
+                "--json",
+                json.dumps({"access_control_list": [{
+                    "service_principal_name": sp_id,
+                    "permission_level": "CAN_MANAGE_RUN",
+                }]}),
+            ],
+            capture=True,
+            check=False,  # PATCH may 4xx on race; second deploy will reconcile
+        )
+        granted += 1
+    info(f"granted CAN_MANAGE_RUN on {granted}/{len(_BUNDLE_JOB_NAME_MATCHES)} bundle jobs")
+
+
 # ----------------------------------------------------------------------------
 # main flow
 # ----------------------------------------------------------------------------
@@ -782,6 +874,12 @@ def main() -> None:
                 ctx.raw_schema:    ["USE_SCHEMA", "SELECT", "MODIFY", "READ_VOLUME", "WRITE_VOLUME"],
             },
         )
+        # B-025: also grant CAN_MANAGE_RUN on the 5 bundle-deployed jobs so
+        # the app's wizard can discover + trigger them. Without this the
+        # orphan-job buttons (Source Normalization / Value Model / Glossary)
+        # 404 with "Databricks job containing 'X' not found" because
+        # `db.jobs.list()` only returns SP-visible jobs.
+        grant_jobs(sp_id=sp_id, profile=ctx.profile, target=ctx.target)
     else:
         info("--skip-grants given; not touching UC grants")
 

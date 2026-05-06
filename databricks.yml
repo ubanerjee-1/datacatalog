@@ -32,20 +32,32 @@ sync:
 variables:
   catalog:
     description: "Unity Catalog that jobs/pipelines write to. Must match BHE_CATALOG in src/app/app.yml."
-    default: "your_catalog"
+    default: "ub_test"
   warehouse_id:
     description: "SQL warehouse ID the app and bundled jobs run against. Must match DATABRICKS_WAREHOUSE_ID in src/app/app.yml."
-    default: "your-warehouse-id"
+    default: "b214eabe85433c68"
 
 targets:
   dev:
     default: true
     mode: development
     workspace:
-      host: https://your-workspace.cloud.databricks.com
-      profile: your-cli-profile
+      host: https://fe-vm-vdm-classic-hagyfi.cloud.databricks.com
+      profile: uban
     variables:
-      catalog: "your_catalog"
+      catalog: "ub_test"
+
+  # `e2e` mirrors `dev` (same workspace + catalog) but produces a
+  # second App resource (`bhe-data-catalog-e2e`) so we can validate
+  # an unrelated build/deploy without disturbing the active dev app.
+  # Re-deploy with `python scripts/deploy.py --target e2e ...`.
+  e2e:
+    mode: development
+    workspace:
+      host: https://fe-vm-vdm-classic-hagyfi.cloud.databricks.com
+      profile: uban
+    variables:
+      catalog: "ub_test"
 
   prod:
     mode: production

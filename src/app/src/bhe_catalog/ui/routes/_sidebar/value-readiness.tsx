@@ -1,4 +1,4 @@
-import { createFileRoute, useNavigate } from "@tanstack/react-router";
+import { createFileRoute, Link, useNavigate } from "@tanstack/react-router";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
@@ -319,6 +319,12 @@ function ValueReadinessPage() {
               conversation in a specific operating company.
             </p>
           </div>
+          <Link
+            to="/use-cases"
+            className="text-sm text-primary hover:underline whitespace-nowrap"
+          >
+            Manage use cases →
+          </Link>
         </div>
 
         <KpiStrip summary={summaryData} loading={summaryLoading} />

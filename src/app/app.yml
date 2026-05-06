@@ -23,12 +23,12 @@ env:
   # catalog on first run. The app's service principal must have
   # USE_CATALOG + CREATE_SCHEMA on it.
   - name: BHE_CATALOG
-    value: "your_catalog"
+    value: "ub_test"
 
   # SQL Warehouse the app routes every Statement Execution call through.
   # The app's service principal must have CAN_USE on this warehouse.
   - name: DATABRICKS_WAREHOUSE_ID
-    value: "your-warehouse-id"
+    value: "b214eabe85433c68"
 
   # ---- Schema names (rarely need to change) --------------------------------
   - name: BHE_RAW_SCHEMA

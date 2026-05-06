@@ -12,6 +12,7 @@ import { Route as rootRouteImport } from './../routes/__root'
 import { Route as SidebarRouteRouteImport } from './../routes/_sidebar/route'
 import { Route as IndexRouteImport } from './../routes/index'
 import { Route as SidebarValueReadinessRouteImport } from './../routes/_sidebar/value-readiness'
+import { Route as SidebarUseCasesRouteImport } from './../routes/_sidebar/use-cases'
 import { Route as SidebarTaxonomyRouteImport } from './../routes/_sidebar/taxonomy'
 import { Route as SidebarSourceSystemsRouteImport } from './../routes/_sidebar/source-systems'
 import { Route as SidebarRulesRouteImport } from './../routes/_sidebar/rules'
@@ -38,6 +39,11 @@ const IndexRoute = IndexRouteImport.update({
 const SidebarValueReadinessRoute = SidebarValueReadinessRouteImport.update({
   id: '/value-readiness',
   path: '/value-readiness',
+  getParentRoute: () => SidebarRouteRoute,
+} as any)
+const SidebarUseCasesRoute = SidebarUseCasesRouteImport.update({
+  id: '/use-cases',
+  path: '/use-cases',
   getParentRoute: () => SidebarRouteRoute,
 } as any)
 const SidebarTaxonomyRoute = SidebarTaxonomyRouteImport.update({
@@ -121,6 +127,7 @@ export interface FileRoutesByFullPath {
   '/rules': typeof SidebarRulesRoute
   '/source-systems': typeof SidebarSourceSystemsRoute
   '/taxonomy': typeof SidebarTaxonomyRoute
+  '/use-cases': typeof SidebarUseCasesRoute
   '/value-readiness': typeof SidebarValueReadinessRoute
 }
 export interface FileRoutesByTo {
@@ -138,6 +145,7 @@ export interface FileRoutesByTo {
   '/rules': typeof SidebarRulesRoute
   '/source-systems': typeof SidebarSourceSystemsRoute
   '/taxonomy': typeof SidebarTaxonomyRoute
+  '/use-cases': typeof SidebarUseCasesRoute
   '/value-readiness': typeof SidebarValueReadinessRoute
 }
 export interface FileRoutesById {
@@ -157,6 +165,7 @@ export interface FileRoutesById {
   '/_sidebar/rules': typeof SidebarRulesRoute
   '/_sidebar/source-systems': typeof SidebarSourceSystemsRoute
   '/_sidebar/taxonomy': typeof SidebarTaxonomyRoute
+  '/_sidebar/use-cases': typeof SidebarUseCasesRoute
   '/_sidebar/value-readiness': typeof SidebarValueReadinessRoute
 }
 export interface FileRouteTypes {
@@ -176,6 +185,7 @@ export interface FileRouteTypes {
     | '/rules'
     | '/source-systems'
     | '/taxonomy'
+    | '/use-cases'
     | '/value-readiness'
   fileRoutesByTo: FileRoutesByTo
   to:
@@ -193,6 +203,7 @@ export interface FileRouteTypes {
     | '/rules'
     | '/source-systems'
     | '/taxonomy'
+    | '/use-cases'
     | '/value-readiness'
   id:
     | '__root__'
@@ -211,6 +222,7 @@ export interface FileRouteTypes {
     | '/_sidebar/rules'
     | '/_sidebar/source-systems'
     | '/_sidebar/taxonomy'
+    | '/_sidebar/use-cases'
     | '/_sidebar/value-readiness'
   fileRoutesById: FileRoutesById
 }
@@ -240,6 +252,13 @@ declare module '@tanstack/react-router' {
       path: '/value-readiness'
       fullPath: '/value-readiness'
       preLoaderRoute: typeof SidebarValueReadinessRouteImport
+      parentRoute: typeof SidebarRouteRoute
+    }
+    '/_sidebar/use-cases': {
+      id: '/_sidebar/use-cases'
+      path: '/use-cases'
+      fullPath: '/use-cases'
+      preLoaderRoute: typeof SidebarUseCasesRouteImport
       parentRoute: typeof SidebarRouteRoute
     }
     '/_sidebar/taxonomy': {
@@ -350,6 +369,7 @@ interface SidebarRouteRouteChildren {
   SidebarRulesRoute: typeof SidebarRulesRoute
   SidebarSourceSystemsRoute: typeof SidebarSourceSystemsRoute
   SidebarTaxonomyRoute: typeof SidebarTaxonomyRoute
+  SidebarUseCasesRoute: typeof SidebarUseCasesRoute
   SidebarValueReadinessRoute: typeof SidebarValueReadinessRoute
 }
 
@@ -367,6 +387,7 @@ const SidebarRouteRouteChildren: SidebarRouteRouteChildren = {
   SidebarRulesRoute: SidebarRulesRoute,
   SidebarSourceSystemsRoute: SidebarSourceSystemsRoute,
   SidebarTaxonomyRoute: SidebarTaxonomyRoute,
+  SidebarUseCasesRoute: SidebarUseCasesRoute,
   SidebarValueReadinessRoute: SidebarValueReadinessRoute,
 }
 

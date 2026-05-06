@@ -5,10 +5,12 @@ All endpoints for catalog browsing, Sankey data, company research, and job manag
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
 import re
+import time
 import uuid
 from datetime import datetime
 from typing import Optional
@@ -81,8 +83,13 @@ from .models import (
     TAXONOMY_DIMENSIONS,
     USE_CASE_STATUSES,
     UseCaseAffiliateUpsertIn,
+    UseCaseCandidate,
     UseCaseCreateIn,
     UseCaseEntityUpsertIn,
+    UseCaseGenerateCommitIn,
+    UseCaseGenerateCommitOut,
+    UseCaseGenerateIn,
+    UseCaseGenerateOut,
     UseCaseOut,
     UseCaseSourceRequirementUpsertIn,
     UseCaseStatusIn,
@@ -281,7 +288,8 @@ _SETUP_SILVER_DDL: dict[str, str] = {
         comment STRING,
         created STRING,
         last_altered STRING,
-        workspace_url STRING,
+        workspace_url STRING COMMENT 'Workspace_url of the most-recently-altered observation across the multi-workspace bronze extract',
+        workspace_count BIGINT COMMENT 'How many distinct workspaces saw this (catalog, schema). 1 = visible from a single workspace; >1 = shared (e.g. samples).',
         environment STRING,
         zone STRING,
         program STRING,
@@ -293,7 +301,7 @@ _SETUP_SILVER_DDL: dict[str, str] = {
         data_sensitivity STRING,
         is_user_edited BOOLEAN,
         user_edited_at STRING
-    ) USING DELTA COMMENT 'Silver: schema-grain catalog inventory ingested from extractor CSV'""",
+    ) USING DELTA COMMENT 'Silver: schema-grain catalog inventory ingested from extractor CSV (1 row per (catalog, schema); cross-workspace dupes collapsed at ingest)'""",
     # Table-grain inventory. `source_system` / `source_system_canonical` are
     # included from day-one so the normalize_source_systems job's ALTER+MERGE
     # is a no-op on a fresh deploy and the read paths (Schema Explorer,
@@ -308,6 +316,7 @@ _SETUP_SILVER_DDL: dict[str, str] = {
         created STRING,
         last_altered STRING,
         data_source_format STRING,
+        workspace_count BIGINT COMMENT 'How many distinct workspaces saw this (catalog, schema, table). 1 = visible from a single workspace; >1 = shared.',
         classification STRING,
         ai_definition STRING,
         business_friendly_name STRING,
@@ -315,7 +324,7 @@ _SETUP_SILVER_DDL: dict[str, str] = {
         user_edited_at STRING,
         source_system STRING COMMENT 'Raw value populated by normalize_source_systems job',
         source_system_canonical STRING COMMENT 'Resolved canonical populated by normalize_source_systems job'
-    ) USING DELTA COMMENT 'Silver: table-grain catalog inventory ingested from extractor CSV'""",
+    ) USING DELTA COMMENT 'Silver: table-grain catalog inventory ingested from extractor CSV (1 row per (catalog, schema, table); cross-workspace dupes collapsed at ingest)'""",
     "company_profile": """CREATE TABLE IF NOT EXISTS {fqn} (
         id STRING, company_name STRING, industry STRING, sub_industry STRING,
         description STRING, headquarters STRING, key_business_units STRING,
@@ -328,12 +337,32 @@ _SETUP_SILVER_DDL: dict[str, str] = {
         key_functions STRING, data_needs STRING, company_name STRING,
         is_user_edited BOOLEAN
     ) USING DELTA""",
+    # `use_cases` carries three waves of columns. Keep in sync with the
+    # standalone `bootstrap_tables.py` script — both create this table and
+    # both must agree on the up-to-date shape so Gabriel's fresh deploys at
+    # BHE never need a defensive ALTER. `_ensure_use_case_status_columns()`
+    # below mirrors this list and ALTERs already-deployed envs that pre-date
+    # the additions; on a fresh deploy it's a no-op.
     "use_cases": """CREATE TABLE IF NOT EXISTS {fqn} (
         id STRING, use_case_name STRING, description STRING,
         department STRING, category STRING, business_value STRING,
         estimated_value_usd DOUBLE, value_rationale STRING,
         data_requirements STRING, priority STRING, company_name STRING,
-        is_user_edited BOOLEAN
+        is_user_edited BOOLEAN,
+        -- Wave 2: delivery lifecycle (Value & Readiness).
+        status STRING COMMENT 'Delivery lifecycle: not_started|in_progress|delivered|on_hold',
+        status_notes STRING,
+        status_updated_at TIMESTAMP,
+        created_at TIMESTAMP,
+        -- Wave 3: generation lens (PR 2 of UC redesign).
+        affiliate STRING,
+        lens STRING COMMENT 'ready|gap|manual',
+        time_horizon STRING COMMENT 'quick_win|strategic|NULL',
+        value_type STRING COMMENT 'cost|revenue|risk|mixed|NULL',
+        is_regulatory BOOLEAN,
+        required_canonicals STRING COMMENT 'JSON array of canonical source names',
+        generated_at TIMESTAMP,
+        generated_by STRING COMMENT 'llm endpoint id, or "chat" for free-form'
     ) USING DELTA""",
     "use_case_entities": """CREATE TABLE IF NOT EXISTS {fqn} (
         entity_id STRING, use_case_id STRING, use_case_name STRING,
@@ -346,6 +375,25 @@ _SETUP_SILVER_DDL: dict[str, str] = {
         item_name STRING, parent_item STRING, detail STRING,
         created_at TIMESTAMP
     ) USING DELTA""",
+    # Durable mirror of the in-process `_active_runs` dict (B-009).
+    # Every job-trigger endpoint and every inline-thread runner
+    # write-throughs status updates to this table so an app restart
+    # (deploy, scale event, crash) doesn't strand the UI on a 404 from
+    # GET /jobs/{run_id}/status. `databricks_run_id` is populated for
+    # job-backed runs so the polling endpoint can reconcile against
+    # the Databricks Jobs API even when the in-memory cache is cold.
+    "job_runs": """CREATE TABLE IF NOT EXISTS {fqn} (
+        run_id              STRING NOT NULL,
+        job_type            STRING,
+        status              STRING,
+        start_time          STRING,
+        end_time            STRING,
+        error               STRING,
+        databricks_job_id   STRING,
+        databricks_run_id   STRING,
+        company_name        STRING,
+        updated_at          TIMESTAMP
+    ) USING DELTA COMMENT 'Persistent run-state for in-process and bundle-backed jobs (B-009)'""",
     "sankey_mappings": """CREATE TABLE IF NOT EXISTS {fqn} (
         id STRING, source_system STRING, source_category STRING,
         use_case STRING, department STRING, entity_name STRING,
@@ -1597,11 +1645,23 @@ _USE_CASE_STATUS_COLUMNS_READY = False
 
 
 def _ensure_use_case_status_columns() -> None:
-    """Idempotently add status columns to bhe_silver.use_cases.
+    """Idempotently add status + PR 2 classification columns to bhe_silver.use_cases.
 
     Uses DESCRIBE-then-ALTER (same pattern as normalize_source_systems.py) so
     this is safe to call repeatedly and safe to ship with environments whose
     Delta runtime doesn't support ``ADD COLUMN IF NOT EXISTS``.
+
+    Two waves of columns are folded into this single helper because every
+    read path that cares about ``use_cases`` already calls it; widening the
+    column set is cheaper than adding a sibling helper that every caller has
+    to remember.
+
+    Wave 1 — delivery lifecycle: ``status``, ``status_notes``,
+    ``status_updated_at`` (Value & Readiness "delivered" tracking).
+    Wave 2 — generation lens (PR 2 of the UC redesign):
+        ``affiliate``, ``lens``, ``time_horizon``, ``value_type``,
+        ``is_regulatory``, ``required_canonicals``, ``generated_at``,
+        ``generated_by``.
     """
     global _USE_CASE_STATUS_COLUMNS_READY
     if _USE_CASE_STATUS_COLUMNS_READY:
@@ -1629,12 +1689,49 @@ def _ensure_use_case_status_columns() -> None:
             to_add.append(
                 "status_updated_at TIMESTAMP COMMENT 'When status last changed'"
             )
+        if "created_at" not in existing:
+            # `created_at` was missing from very early DDLs and the chat-create
+            # path (`insert_use_case_row`) silently fails when it's absent.
+            # Adding here so already-deployed envs catch up; fresh deploys
+            # already have it via the bootstrap DDL.
+            to_add.append("created_at TIMESTAMP")
+        # PR 2 — generation lens columns. Default to NULL on existing rows;
+        # the structured generator will populate them, and chat-created UCs
+        # leave them NULL (read paths COALESCE to "manual" lens).
+        if "affiliate" not in existing:
+            to_add.append(
+                "affiliate STRING COMMENT 'Affiliate this UC was generated for'"
+            )
+        if "lens" not in existing:
+            to_add.append(
+                "lens STRING COMMENT 'ready|gap|manual'"
+            )
+        if "time_horizon" not in existing:
+            to_add.append(
+                "time_horizon STRING COMMENT 'quick_win|strategic|NULL'"
+            )
+        if "value_type" not in existing:
+            to_add.append(
+                "value_type STRING COMMENT 'cost|revenue|risk|mixed|NULL'"
+            )
+        if "is_regulatory" not in existing:
+            to_add.append("is_regulatory BOOLEAN")
+        if "required_canonicals" not in existing:
+            to_add.append(
+                "required_canonicals STRING COMMENT 'JSON array of canonical source names'"
+            )
+        if "generated_at" not in existing:
+            to_add.append("generated_at TIMESTAMP")
+        if "generated_by" not in existing:
+            to_add.append(
+                "generated_by STRING COMMENT 'llm endpoint id or \"chat\"'"
+            )
         if to_add:
             execute_query(
                 f"ALTER TABLE {tbl} ADD COLUMNS (" + ", ".join(to_add) + ")"
             )
             logger.info(
-                "Added use_cases status columns: %s", ", ".join(to_add)
+                "Added use_cases columns: %s", ", ".join(to_add)
             )
         _USE_CASE_STATUS_COLUMNS_READY = True
     except Exception as e:
@@ -1665,7 +1762,8 @@ _SILVER_TABLES_SOURCE_COLUMNS_READY = False
 
 
 def _ensure_silver_tables_columns() -> None:
-    """Idempotently add `source_system` / `source_system_canonical` to silver_tables.
+    """Idempotently add `source_system` / `source_system_canonical` /
+    `workspace_count` to silver_tables.
 
     Safe to call repeatedly; uses a process-local flag to avoid issuing DDL on
     every request after the first success. Failures (e.g. table doesn't exist
@@ -1697,6 +1795,10 @@ def _ensure_silver_tables_columns() -> None:
             to_add.append(
                 "source_system_canonical STRING COMMENT 'Resolved canonical name (added by normalize_source_systems job)'"
             )
+        if "workspace_count" not in existing:
+            to_add.append(
+                "workspace_count BIGINT COMMENT 'How many distinct workspaces saw this (catalog, schema, table) in the bronze extract'"
+            )
         if to_add:
             execute_update(
                 f"ALTER TABLE {tbl} ADD COLUMNS (" + ", ".join(to_add) + ")",
@@ -1708,6 +1810,49 @@ def _ensure_silver_tables_columns() -> None:
         _SILVER_TABLES_SOURCE_COLUMNS_READY = True
     except Exception as e:
         logger.warning(f"_ensure_silver_tables_columns failed: {e}")
+
+
+_SILVER_SCHEMAS_COLUMNS_READY = False
+
+
+def _ensure_silver_schemas_columns() -> None:
+    """Idempotently add `workspace_count` to silver_schemas for existing deploys.
+
+    Mirrors `_ensure_silver_tables_columns`. Fresh deploys get this column
+    from `_SETUP_SILVER_DDL` / `bootstrap_tables.py`; this helper only fires
+    on environments deployed before the column was introduced (post-2026-05).
+    """
+    global _SILVER_SCHEMAS_COLUMNS_READY
+    if _SILVER_SCHEMAS_COLUMNS_READY:
+        return
+    silver = get_silver_schema()
+    tbl = fqn(silver, "silver_schemas")
+    try:
+        rows = execute_query(
+            f"DESCRIBE TABLE {tbl}",
+            tag_overrides={"submodule": "ensure_silver_schemas_cols_describe"},
+        )
+        existing = {
+            (r.get("col_name") or "").lower()
+            for r in rows or []
+            if r.get("col_name") and not str(r.get("col_name")).startswith("#")
+        }
+        to_add: list[str] = []
+        if "workspace_count" not in existing:
+            to_add.append(
+                "workspace_count BIGINT COMMENT 'How many distinct workspaces saw this (catalog, schema) in the bronze extract'"
+            )
+        if to_add:
+            execute_update(
+                f"ALTER TABLE {tbl} ADD COLUMNS (" + ", ".join(to_add) + ")",
+                tag_overrides={"submodule": "ensure_silver_schemas_cols_alter"},
+            )
+            logger.info(
+                "Added silver_schemas columns: %s", ", ".join(c.split(' ', 1)[0] for c in to_add)
+            )
+        _SILVER_SCHEMAS_COLUMNS_READY = True
+    except Exception as e:
+        logger.warning(f"_ensure_silver_schemas_columns failed: {e}")
 
 
 def _normalize_status(value: Optional[str]) -> str:
@@ -3872,6 +4017,32 @@ async def delete_sankey_mapping(mapping_id: str) -> dict:
 # ---------------------------------------------------------------------------
 
 
+def _parse_list_field(value: str) -> list[str]:
+    """Tolerant list parser for `key_business_units` / `strategic_priorities`.
+
+    The write path (company-research) stores these as comma-separated
+    strings because the LLM prompt explicitly asks for that shape. An
+    earlier read path was `json.loads(value or "[]")` which threw on every
+    real row and got swallowed by a bare `except Exception:` — making the
+    whole profile endpoint silently return blanks even when the underlying
+    table had a complete record.
+
+    Accept both shapes: a JSON array (e.g. `["A","B"]`) for forward-compat,
+    and a comma-separated string for what's actually written today.
+    """
+    if not value:
+        return []
+    s = value.strip()
+    if s.startswith("[") and s.endswith("]"):
+        try:
+            parsed = json.loads(s)
+            if isinstance(parsed, list):
+                return [str(x).strip() for x in parsed if str(x).strip()]
+        except Exception:
+            pass
+    return [piece.strip() for piece in s.split(",") if piece.strip()]
+
+
 @router.get("/company/profile", operation_id="companyProfile")
 async def company_profile() -> CompanyProfileOut:
     silver = get_silver_schema()
@@ -3890,15 +4061,18 @@ async def company_profile() -> CompanyProfileOut:
             sub_industry=r.get("sub_industry", ""),
             description=r.get("description", ""),
             headquarters=r.get("headquarters", ""),
-            key_business_units=json.loads(r.get("key_business_units", "[]")),
-            strategic_priorities=json.loads(r.get("strategic_priorities", "[]")),
+            key_business_units=_parse_list_field(r.get("key_business_units", "")),
+            strategic_priorities=_parse_list_field(r.get("strategic_priorities", "")),
             regulatory_environment=r.get("regulatory_environment", ""),
             catalog_name=r.get("catalog_name", "") or "",
             logo_url=r.get("logo_url", "") or "",
             primary_domain=r.get("primary_domain", "") or "",
             branding_user_edited=bool(r.get("branding_user_edited") in (True, "true", 1, "1")),
         )
-    except Exception:
+    except Exception as e:
+        # The bare except previously hid real failures (e.g. JSON parse
+        # bugs above). Log so the next regression is visible in app logs.
+        logger.warning(f"company_profile read failed: {e}")
         return CompanyProfileOut()
 
 
@@ -4133,18 +4307,23 @@ async def list_departments() -> list[DepartmentOut]:
         rows = execute_query(
             f"SELECT * FROM {fqn(silver, 'departments')} ORDER BY department_name"
         )
+        # Tolerant list parsing for `key_functions` — same shape mismatch as
+        # `company_profile.key_business_units`. The write path stores
+        # comma-separated strings; the read path used to `json.loads(...)`
+        # and silently returned `[]` for every row when that threw.
         return [
             DepartmentOut(
                 id=r.get("id", ""),
                 department_name=r.get("department_name", ""),
                 description=r.get("description", ""),
-                key_functions=json.loads(r.get("key_functions", "[]")),
+                key_functions=_parse_list_field(r.get("key_functions", "")),
                 data_needs=r.get("data_needs", ""),
                 is_user_edited=r.get("is_user_edited", False),
             )
             for r in rows
         ]
-    except Exception:
+    except Exception as e:
+        logger.warning(f"list_departments read failed: {e}")
         return []
 
 
@@ -4216,6 +4395,15 @@ async def list_use_cases(
                     if r.get("status_updated_at") else None
                 ),
                 is_user_edited=_to_bool(r.get("is_user_edited", False)),
+                # PR 2 lens fields. The backend stores `required_canonicals`
+                # as a JSON string in Delta and parses on read so the wire
+                # shape matches `data_requirements`.
+                affiliate=r.get("affiliate") or None,
+                lens=r.get("lens") or None,
+                time_horizon=r.get("time_horizon") or None,
+                value_type=r.get("value_type") or None,
+                is_regulatory=_to_bool(r.get("is_regulatory")) if r.get("is_regulatory") is not None else None,
+                required_canonicals=_raw_reqs(r.get("required_canonicals", "[]")),
             )
             for r in rows
         ]
@@ -4474,6 +4662,664 @@ async def delete_use_case(uc_id: str) -> dict:
         f"DELETE FROM {fqn(silver, 'use_cases')} WHERE id = '{uc}'"
     )
     return {"status": "deleted", "id": uc_id}
+
+
+# ---------------------------------------------------------------------------
+# PR 2 — Structured Use Case Generation
+#
+# A dedicated, on-demand generator scoped to a single (affiliate, department,
+# lens) cell. Decoupled from `company_research` so users can iterate on
+# individual slices without re-running the bulk pipeline.
+#
+# Lenses:
+#   - "ready"  : ground prompt in the canonicals + tables already mapped to
+#                this affiliate (silver_tables.source_system_canonical joined
+#                via program_affiliate_map). Each UC references real data.
+#   - "gap"    : ground prompt in the canonicals the affiliate does NOT have.
+#                Each UC drives an ingest target.
+#   - "both"   : ask the LLM for a mixed batch; each UC is tagged.
+#
+# Two-step UX: dry-run preview (cached for ~10 min) → user picks subset →
+# commit. Avoids paying for the LLM when the user discards the batch and
+# avoids partial writes on cancel.
+# ---------------------------------------------------------------------------
+
+
+_GENERATED_UC_RESPONSE_SCHEMA: str = json.dumps({
+    "type": "json_schema",
+    "json_schema": {
+        "name": "generated_use_cases",
+        "schema": {
+            "type": "object",
+            "properties": {
+                "use_cases": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "use_case_name":        {"type": "string"},
+                            "description":          {"type": "string"},
+                            "business_value":       {"type": "string"},
+                            "estimated_value_usd":  {"type": "number"},
+                            "value_rationale":      {"type": "string"},
+                            "priority":             {"type": "string"},
+                            "category":             {"type": "string"},
+                            "lens":                 {"type": "string"},
+                            "time_horizon":         {"type": "string"},
+                            "value_type":           {"type": "string"},
+                            "is_regulatory":        {"type": "boolean"},
+                            "data_requirements": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                            },
+                            "required_canonicals": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                            },
+                        },
+                        "required": [
+                            "use_case_name", "description", "business_value",
+                            "priority", "category", "lens",
+                            "time_horizon", "value_type", "is_regulatory",
+                            "data_requirements", "required_canonicals",
+                        ],
+                    },
+                },
+            },
+            "required": ["use_cases"],
+        },
+        "strict": True,
+    },
+})
+
+
+# In-process preview cache. Tuple = (created_ts_epoch, UseCaseGenerateOut).
+# Keyed by `preview_id` (uuid). Entries expire after _UC_PREVIEW_TTL_SEC and
+# the cache is best-effort: a process restart between preview and commit
+# means the user re-runs the generator, which is annoying but cheap.
+_uc_preview_cache: dict[str, tuple[float, dict]] = {}
+_UC_PREVIEW_TTL_SEC = 10 * 60  # 10 minutes
+
+
+def _uc_preview_gc() -> None:
+    """Drop expired preview entries. Cheap; called on every preview/commit."""
+    cutoff = time.time() - _UC_PREVIEW_TTL_SEC
+    stale = [k for k, (ts, _) in _uc_preview_cache.items() if ts < cutoff]
+    for k in stale:
+        _uc_preview_cache.pop(k, None)
+
+
+def _resolve_canonicals_for_affiliate(affiliate: str) -> tuple[list[dict], list[str]]:
+    """Return (present_with_table_counts, missing_canonicals) for `affiliate`.
+
+    "Present" = canonicals reachable via program -> affiliate -> tables, where
+    the table actually has `source_system_canonical` populated by the
+    normalize job. "Missing" = canonicals registered in
+    ``gold.source_system_canonical`` that are NOT in the present set. The
+    present list also carries up to 5 sample table names per canonical so
+    the prompt can ground generation in real assets.
+
+    Either list may be empty when the deployment hasn't run all upstream
+    jobs yet; callers should fall back to an industry-context-only prompt
+    in that case.
+    """
+    silver = get_silver_schema()
+    gold = get_gold_schema()
+    aff = _sql_escape(affiliate)
+    present: list[dict] = []
+    try:
+        # Sample tables per canonical, limited via window function so we
+        # don't drag thousands of rows back into the prompt.
+        rows = execute_query(f"""
+            WITH affiliate_tables AS (
+              SELECT
+                t.source_system_canonical AS canonical,
+                t.table_catalog,
+                t.table_schema,
+                t.table_name,
+                ROW_NUMBER() OVER (
+                  PARTITION BY t.source_system_canonical
+                  ORDER BY t.table_catalog, t.table_schema, t.table_name
+                ) AS rn,
+                COUNT(*) OVER (PARTITION BY t.source_system_canonical) AS canonical_table_count
+              FROM {fqn(silver, 'silver_tables')} t
+              JOIN {fqn(silver, 'silver_schemas')} s
+                ON t.table_catalog = s.catalog_name
+               AND t.table_schema = s.schema_name
+              JOIN {fqn(gold, 'program_affiliate_map')} pam
+                ON s.program = pam.program
+              WHERE pam.affiliate_name = '{aff}'
+                AND t.source_system_canonical IS NOT NULL
+                AND TRIM(t.source_system_canonical) <> ''
+            )
+            SELECT canonical, canonical_table_count, table_catalog, table_schema, table_name
+            FROM affiliate_tables
+            WHERE rn <= 5
+            ORDER BY canonical_table_count DESC, canonical, rn
+        """)
+        by_canonical: dict[str, dict] = {}
+        for r in rows or []:
+            c = r.get("canonical") or ""
+            if not c:
+                continue
+            entry = by_canonical.setdefault(c, {
+                "canonical": c,
+                "table_count": int(r.get("canonical_table_count") or 0),
+                "sample_tables": [],
+            })
+            tbl = ".".join(
+                str(r.get(k) or "")
+                for k in ("table_catalog", "table_schema", "table_name")
+            ).strip(".")
+            if tbl:
+                entry["sample_tables"].append(tbl)
+        present = sorted(
+            by_canonical.values(),
+            key=lambda d: (-d["table_count"], d["canonical"]),
+        )
+    except Exception as e:
+        logger.warning(f"_resolve_canonicals_for_affiliate present failed: {e}")
+    present_set = {p["canonical"] for p in present}
+
+    # Missing = registered canonicals that aren't currently mapped to this
+    # affiliate. Used for "gap" lens prompts.
+    missing: list[str] = []
+    try:
+        all_rows = execute_query(
+            f"SELECT DISTINCT canonical "
+            f"FROM {fqn(gold, 'source_system_canonical')} "
+            f"WHERE canonical IS NOT NULL AND TRIM(canonical) <> ''"
+        )
+        for r in all_rows or []:
+            c = r.get("canonical") or ""
+            if c and c not in present_set:
+                missing.append(c)
+        missing.sort()
+    except Exception as e:
+        logger.warning(f"_resolve_canonicals_for_affiliate missing failed: {e}")
+    return present, missing
+
+
+def _build_uc_generation_prompt(
+    *,
+    company_profile: dict,
+    affiliate: dict,
+    department: dict,
+    lens: str,
+    count: int,
+    canonicals_present: list[dict],
+    canonicals_missing: list[str],
+    time_horizon_bias: str,
+    value_type_bias: str,
+    prioritize_regulatory: bool,
+) -> str:
+    """Construct the LLM prompt for use case generation.
+
+    The prompt is deliberately verbose. We've observed that ai_query (Sonnet)
+    drops constraints that aren't repeated in both the system framing and
+    the per-field requirements; the closed-vocabulary tags (``lens``,
+    ``time_horizon``, ``value_type``, ``priority``, ``category``) are the
+    most important to anchor.
+    """
+    company_name = (company_profile.get("company_name") or "").strip() or "the company"
+    industry = (company_profile.get("industry") or "").strip() or "—"
+    sub_industry = (company_profile.get("sub_industry") or "").strip() or "—"
+    regulatory_env = (company_profile.get("regulatory_environment") or "").strip() or "—"
+
+    aff_name = (affiliate.get("affiliate_name") or "").strip() or "—"
+    aff_type = (affiliate.get("business_type") or "").strip() or "—"
+    aff_region = (affiliate.get("region") or "").strip() or "—"
+    aff_desc = (affiliate.get("description") or "").strip()
+
+    dept_name = (department.get("department_name") or department.get("name") or "").strip() or "—"
+    dept_desc = (department.get("description") or "").strip()
+    dept_needs = (department.get("data_needs") or "").strip()
+
+    # Render available canonicals with up to 5 sample tables each so the
+    # LLM can reference concrete assets in `description` and
+    # `data_requirements`.
+    if canonicals_present:
+        present_lines = []
+        for p in canonicals_present[:25]:  # cap at 25 to avoid prompt bloat
+            samples = ", ".join(p["sample_tables"][:5])
+            present_lines.append(
+                f"  - {p['canonical']} ({p['table_count']} tables; e.g. {samples})"
+            )
+        present_block = "\n".join(present_lines)
+    else:
+        present_block = "  (none — affiliate has no canonical sources mapped yet)"
+
+    if canonicals_missing:
+        missing_block = "\n".join(
+            f"  - {c}" for c in canonicals_missing[:30]
+        )
+    else:
+        missing_block = "  (every registered canonical is already present for this affiliate)"
+
+    lens_rule = {
+        "ready": (
+            "ONLY generate use cases that can be implemented today using the "
+            "AVAILABLE canonical sources. Every `required_canonicals` entry "
+            "MUST come from the AVAILABLE list. Set `lens` = \"ready\"."
+        ),
+        "gap": (
+            "ONLY generate high-value use cases that REQUIRE canonical sources "
+            "the affiliate does NOT yet have. Every `required_canonicals` entry "
+            "MUST come from the MISSING list. Set `lens` = \"gap\"."
+        ),
+        "both": (
+            "Generate a balanced MIX. About half of the use cases should be "
+            "implementable today (lens=\"ready\", canonicals from AVAILABLE), "
+            "and the other half should require new ingestion (lens=\"gap\", "
+            "canonicals from MISSING). Tag each one accurately."
+        ),
+    }.get(lens, "")
+
+    horizon_block = {
+        "any": "(no preference — pick whatever fits each use case)",
+        "quick_win": "Strongly prefer use cases deliverable in ≤ 3 months ("
+                    "tag time_horizon=\"quick_win\").",
+        "strategic": "Strongly prefer strategic, multi-quarter initiatives "
+                    "(tag time_horizon=\"strategic\").",
+    }.get(time_horizon_bias, "(no preference)")
+
+    value_block = {
+        "any": "(no preference — pick whatever fits each use case)",
+        "cost": "Strongly prefer cost-reduction use cases (tag value_type=\"cost\").",
+        "revenue": "Strongly prefer revenue-growth use cases (tag value_type=\"revenue\").",
+        "risk": "Strongly prefer risk / compliance use cases (tag value_type=\"risk\").",
+    }.get(value_type_bias, "(no preference)")
+
+    regulatory_block = (
+        "At least 30% of use cases must be primarily driven by regulatory "
+        "requirements (is_regulatory=true)."
+        if prioritize_regulatory
+        else "Tag is_regulatory=true only when a use case is genuinely driven "
+             "by a regulatory requirement; otherwise false."
+    )
+
+    prompt = f"""You are a senior data strategy consultant for {company_name}.
+Industry: {industry} / {sub_industry}
+Regulatory environment: {regulatory_env}
+
+OPERATING AFFILIATE: {aff_name} ({aff_type}, {aff_region})
+Affiliate description: {aff_desc or '—'}
+
+DEPARTMENT: {dept_name}
+Department description: {dept_desc or '—'}
+Stated data needs: {dept_needs or '—'}
+
+AVAILABLE canonical sources (the affiliate already has these — use them for "ready" use cases):
+{present_block}
+
+MISSING canonical sources (industry-typical but NOT yet ingested — use them for "gap" use cases):
+{missing_block}
+
+GENERATION LENS = "{lens}":
+{lens_rule}
+
+GENERATION BIASES:
+- Time horizon: {horizon_block}
+- Value type:   {value_block}
+- Regulatory:   {regulatory_block}
+
+For EACH use case return:
+- use_case_name: short, specific title (e.g. "Predictive Transformer Failure")
+- description: 2-3 sentences explaining what it does and why it matters
+- business_value: 1-2 sentence customer-facing pitch
+- estimated_value_usd: best-estimate annual dollar value (number, no currency symbol)
+- value_rationale: 1-2 sentences justifying the dollar figure
+- priority: "High" | "Medium" | "Low"
+- category: one of [Predictive Analytics, Reporting and BI, ML/AI, Data Integration, Real-Time Monitoring, Regulatory Compliance, Customer Analytics, Operational Efficiency, Risk Management, Revenue Optimization]
+- lens: "ready" or "gap" (must obey the LENS rule above)
+- time_horizon: "quick_win" or "strategic"
+- value_type: "cost" | "revenue" | "risk" | "mixed"
+- is_regulatory: true | false
+- data_requirements: 2-5 short bullet strings describing the data needed
+- required_canonicals: array of canonical source names. For "ready" use cases pick names from the AVAILABLE list. For "gap" use cases pick names from the MISSING list. Use exact names. Empty array is INVALID.
+
+Generate exactly {count} use case(s). Return JSON matching the schema."""
+    return prompt
+
+
+def _candidate_id(use_case_name: str, affiliate: str, department: str) -> str:
+    """Stable hash so identical (name, affiliate, dept) doesn't yield dup ids."""
+    h = hashlib.sha1(
+        f"{(use_case_name or '').strip().lower()}|"
+        f"{(affiliate or '').strip().lower()}|"
+        f"{(department or '').strip().lower()}".encode("utf-8")
+    ).hexdigest()[:12]
+    return f"cand_{h}"
+
+
+def _company_name_for_generation() -> str:
+    silver = get_silver_schema()
+    try:
+        rows = execute_query(
+            f"SELECT company_name FROM {fqn(silver, 'company_profile')} LIMIT 1"
+        )
+        if rows:
+            return (rows[0].get("company_name") or "").strip()
+    except Exception as e:
+        logger.warning(f"company_name_for_generation failed: {e}")
+    return ""
+
+
+def _company_profile_dict() -> dict:
+    silver = get_silver_schema()
+    try:
+        rows = execute_query(
+            f"SELECT company_name, industry, sub_industry, description, "
+            f"regulatory_environment FROM {fqn(silver, 'company_profile')} "
+            f"LIMIT 1"
+        )
+        return rows[0] if rows else {}
+    except Exception as e:
+        logger.warning(f"_company_profile_dict failed: {e}")
+        return {}
+
+
+def _affiliate_dict(name: str) -> dict:
+    gold = get_gold_schema()
+    try:
+        rows = execute_query(
+            f"SELECT affiliate_name, business_type, region, description "
+            f"FROM {fqn(gold, 'affiliates')} "
+            f"WHERE affiliate_name = '{_sql_escape(name)}' LIMIT 1"
+        )
+        return rows[0] if rows else {"affiliate_name": name}
+    except Exception as e:
+        logger.warning(f"_affiliate_dict({name!r}) failed: {e}")
+        return {"affiliate_name": name}
+
+
+def _department_dict(name: str) -> dict:
+    silver = get_silver_schema()
+    try:
+        rows = execute_query(
+            f"SELECT department_name, description, data_needs "
+            f"FROM {fqn(silver, 'departments')} "
+            f"WHERE department_name = '{_sql_escape(name)}' LIMIT 1"
+        )
+        return rows[0] if rows else {"department_name": name}
+    except Exception as e:
+        logger.warning(f"_department_dict({name!r}) failed: {e}")
+        return {"department_name": name}
+
+
+@router.post(
+    "/use-cases/generate",
+    response_model=UseCaseGenerateOut,
+    operation_id="generateUseCases",
+)
+async def generate_use_cases(body: UseCaseGenerateIn) -> UseCaseGenerateOut:
+    """Dry-run generate N use cases for ``(affiliate, department, lens)``.
+
+    Returns a preview that's cached server-side for ~10 minutes; the caller
+    posts back the chosen ``candidate_id``s to ``/use-cases/generate/commit``
+    to persist. Uses ``ai_query`` so the call goes through the warehouse and
+    benefits from the same JSON-schema enforcement as company_research.
+    """
+    _ensure_use_case_status_columns()
+    _uc_preview_gc()
+
+    if not (body.affiliate or "").strip():
+        raise HTTPException(400, "affiliate is required")
+    if not (body.department or "").strip():
+        raise HTTPException(400, "department is required")
+    count = max(1, min(20, int(body.count or 5)))
+    lens = (body.lens or "ready").lower().strip()
+    if lens not in {"ready", "gap", "both"}:
+        raise HTTPException(400, "lens must be one of: ready | gap | both")
+    time_horizon = (body.time_horizon or "any").lower().strip()
+    if time_horizon not in {"any", "quick_win", "strategic"}:
+        raise HTTPException(400, "time_horizon must be: any | quick_win | strategic")
+    value_type = (body.value_type or "any").lower().strip()
+    if value_type not in {"any", "cost", "revenue", "risk"}:
+        raise HTTPException(400, "value_type must be: any | cost | revenue | risk")
+
+    profile = _company_profile_dict()
+    affiliate_row = _affiliate_dict(body.affiliate)
+    department_row = _department_dict(body.department)
+
+    canonicals_present, canonicals_missing = _resolve_canonicals_for_affiliate(body.affiliate)
+    if body.canonical_filter:
+        # Narrow `present` to the user's override and treat the rest of
+        # `present` as advisory (we still surface them in the prompt's
+        # "AVAILABLE" block but the user wanted to focus on a subset).
+        wanted = {c.strip() for c in body.canonical_filter if c and c.strip()}
+        canonicals_present = [
+            p for p in canonicals_present if p["canonical"] in wanted
+        ] or canonicals_present  # fall back if filter excludes everything
+
+    if lens == "ready" and not canonicals_present:
+        raise HTTPException(
+            422,
+            f"Cannot run 'ready' lens for affiliate {body.affiliate!r}: no "
+            "canonical sources are mapped yet. Run AI enrichment + the "
+            "normalize-source-systems job first, or use lens=gap.",
+        )
+
+    prompt = _build_uc_generation_prompt(
+        company_profile=profile,
+        affiliate=affiliate_row,
+        department=department_row,
+        lens=lens,
+        count=count,
+        canonicals_present=canonicals_present,
+        canonicals_missing=canonicals_missing,
+        time_horizon_bias=time_horizon,
+        value_type_bias=value_type,
+        prioritize_regulatory=bool(body.prioritize_regulatory),
+    )
+
+    try:
+        raw = _ai_query(prompt, response_format=_GENERATED_UC_RESPONSE_SCHEMA)
+    except Exception as e:
+        logger.exception("generate_use_cases: ai_query failed")
+        raise HTTPException(502, f"LLM generation failed: {e}")
+
+    try:
+        parsed = json.loads(raw) if raw else {}
+        items = parsed.get("use_cases", []) if isinstance(parsed, dict) else []
+        if isinstance(items, str):  # defensive — strict schema usually prevents this
+            items = json.loads(items)
+        if not isinstance(items, list):
+            items = []
+    except Exception as e:
+        logger.warning(f"generate_use_cases: parse failed: {e!r} raw={raw[:300]!r}")
+        items = []
+
+    candidates: list[UseCaseCandidate] = []
+    seen_names: set[str] = set()
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        name = str(it.get("use_case_name") or "").strip()
+        if not name or name.lower() in seen_names:
+            continue
+        seen_names.add(name.lower())
+        cand_lens = str(it.get("lens") or lens).lower().strip()
+        if cand_lens not in {"ready", "gap"}:
+            cand_lens = "ready" if lens != "gap" else "gap"
+        cand_th = str(it.get("time_horizon") or "").lower().strip() or None
+        cand_vt = str(it.get("value_type") or "").lower().strip() or None
+        candidates.append(UseCaseCandidate(
+            candidate_id=_candidate_id(name, body.affiliate, body.department),
+            use_case_name=name,
+            description=str(it.get("description") or ""),
+            department=body.department,
+            affiliate=body.affiliate,
+            business_value=str(it.get("business_value") or ""),
+            estimated_value_usd=(
+                float(it["estimated_value_usd"])
+                if isinstance(it.get("estimated_value_usd"), (int, float))
+                else None
+            ),
+            value_rationale=str(it.get("value_rationale") or ""),
+            priority=str(it.get("priority") or "Medium"),
+            category=str(it.get("category") or ""),
+            lens=cand_lens,
+            time_horizon=cand_th if cand_th in {"quick_win", "strategic"} else None,
+            value_type=cand_vt if cand_vt in {"cost", "revenue", "risk", "mixed"} else None,
+            is_regulatory=bool(it.get("is_regulatory")),
+            data_requirements=[
+                str(x) for x in (it.get("data_requirements") or []) if x
+            ],
+            required_canonicals=[
+                str(x) for x in (it.get("required_canonicals") or []) if x
+            ],
+        ))
+
+    if not candidates:
+        raise HTTPException(
+            502,
+            "LLM returned no usable use cases (response was empty or "
+            "malformed). Try a smaller count or a different lens.",
+        )
+
+    preview_id = f"prev_{uuid.uuid4().hex[:16]}"
+    expires_at = datetime.utcfromtimestamp(time.time() + _UC_PREVIEW_TTL_SEC).isoformat() + "Z"
+    out = UseCaseGenerateOut(
+        preview_id=preview_id,
+        affiliate=body.affiliate,
+        department=body.department,
+        lens=lens,
+        candidates=candidates,
+        canonicals_present=[p["canonical"] for p in canonicals_present[:25]],
+        canonicals_missing=canonicals_missing[:30],
+        table_sample_count=sum(len(p["sample_tables"]) for p in canonicals_present),
+        expires_at=expires_at,
+    )
+    _uc_preview_cache[preview_id] = (time.time(), out.model_dump())
+    return out
+
+
+@router.post(
+    "/use-cases/generate/commit",
+    response_model=UseCaseGenerateCommitOut,
+    operation_id="commitGeneratedUseCases",
+)
+async def commit_generated_use_cases(
+    body: UseCaseGenerateCommitIn,
+) -> UseCaseGenerateCommitOut:
+    """Persist a subset of a previewed batch into ``silver.use_cases``.
+
+    Idempotent on (affiliate, department, name): if a row already exists with
+    the same name + affiliate + department, the candidate is skipped (we
+    return its count in ``skipped`` so the UI can show "3 inserted, 1
+    duplicate skipped"). All inserted rows carry ``is_user_edited=true`` so
+    pipeline reseeds don't wipe them.
+    """
+    _ensure_use_case_status_columns()
+    _uc_preview_gc()
+
+    cached = _uc_preview_cache.get(body.preview_id)
+    if not cached:
+        raise HTTPException(
+            410,
+            "Preview expired or not found. Re-run generate to create a new preview.",
+        )
+    _, payload = cached
+    candidates_raw: list[dict] = payload.get("candidates") or []
+    by_id = {c.get("candidate_id"): c for c in candidates_raw if c.get("candidate_id")}
+    selected_ids = list(body.selected_ids or [])
+    if not selected_ids:
+        # Default: commit all candidates if user didn't filter.
+        selected_ids = [c.get("candidate_id") for c in candidates_raw if c.get("candidate_id")]
+
+    silver = get_silver_schema()
+    company_name = _company_name_for_generation()
+    inserted: list[str] = []
+    skipped = 0
+
+    for cid in selected_ids:
+        cand = by_id.get(cid)
+        if not cand:
+            skipped += 1
+            continue
+        name = (cand.get("use_case_name") or "").strip()
+        affiliate = (cand.get("affiliate") or "").strip()
+        department = (cand.get("department") or "").strip()
+        if not name:
+            skipped += 1
+            continue
+
+        # De-dupe against existing rows. Same (lower-trim name, affiliate,
+        # department) is treated as already present.
+        try:
+            existing = execute_query(f"""
+                SELECT id FROM {fqn(silver, 'use_cases')}
+                WHERE LOWER(TRIM(use_case_name)) = LOWER('{_sql_escape(name)}')
+                  AND COALESCE(affiliate, '') = '{_sql_escape(affiliate)}'
+                  AND COALESCE(department, '') = '{_sql_escape(department)}'
+                LIMIT 1
+            """)
+            if existing:
+                skipped += 1
+                continue
+        except Exception as e:
+            logger.warning(f"commit dedup check failed for {name!r}: {e}")
+            # Fall through and attempt insert; worst case is a duplicate row
+            # that the user can delete from the UI.
+
+        new_id = f"uc_{uuid.uuid4().hex[:12]}"
+        dr_json = json.dumps(list(cand.get("data_requirements") or []))
+        rc_json = json.dumps(list(cand.get("required_canonicals") or []))
+        est = cand.get("estimated_value_usd")
+        est_sql = (
+            f"{float(est)}" if isinstance(est, (int, float)) else "NULL"
+        )
+        ih = cand.get("time_horizon")
+        vt = cand.get("value_type")
+        try:
+            execute_query(f"""
+                INSERT INTO {fqn(silver, 'use_cases')}
+                    (id, use_case_name, description, department, category,
+                     priority, business_value, estimated_value_usd,
+                     value_rationale, data_requirements, status, status_notes,
+                     status_updated_at, created_at, is_user_edited, company_name,
+                     affiliate, lens, time_horizon, value_type, is_regulatory,
+                     required_canonicals, generated_at, generated_by)
+                VALUES (
+                    '{_sql_escape(new_id)}',
+                    '{_sql_escape(name)}',
+                    '{_sql_escape(cand.get('description') or '')}',
+                    '{_sql_escape(department)}',
+                    '{_sql_escape(cand.get('category') or '')}',
+                    '{_sql_escape(cand.get('priority') or 'Medium')}',
+                    '{_sql_escape(cand.get('business_value') or '')}',
+                    {est_sql},
+                    '{_sql_escape(cand.get('value_rationale') or '')}',
+                    '{_sql_escape(dr_json)}',
+                    'not_started',
+                    '',
+                    NULL,
+                    current_timestamp(),
+                    true,
+                    '{_sql_escape(company_name)}',
+                    '{_sql_escape(affiliate)}',
+                    '{_sql_escape((cand.get('lens') or 'ready'))}',
+                    {f"'{_sql_escape(ih)}'" if ih else 'NULL'},
+                    {f"'{_sql_escape(vt)}'" if vt else 'NULL'},
+                    {str(bool(cand.get('is_regulatory'))).lower()},
+                    '{_sql_escape(rc_json)}',
+                    current_timestamp(),
+                    '{_sql_escape(LLM_ENDPOINT)}'
+                )
+            """)
+            inserted.append(new_id)
+        except Exception as e:
+            logger.warning(f"commit insert failed for {name!r}: {e}")
+            skipped += 1
+
+    # Drop the preview after a successful commit so the UI can't double-commit.
+    _uc_preview_cache.pop(body.preview_id, None)
+    return UseCaseGenerateCommitOut(
+        inserted=len(inserted),
+        skipped=skipped,
+        use_case_ids=inserted,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -5016,6 +5862,161 @@ import threading
 
 _active_runs: dict[str, dict] = {}
 
+
+# ---------------------------------------------------------------------------
+# B-009: persistent job-run state
+#
+# `_active_runs` is a write-through cache in front of `bhe_silver.job_runs`.
+# Every job-trigger / inline-thread runner writes status transitions via
+# `_upsert_run`, which updates the dict AND merges into the table. Reads
+# fall back to the table when the dict is cold (typically right after an
+# app restart).
+#
+# Design notes:
+#   - Status transitions ALWAYS go through _upsert_run; never mutate the
+#     dict directly. This keeps the durable copy in sync.
+#   - The table uses STRING for timestamps (mirroring _active_runs's
+#     isoformat strings) so the same in-memory shape round-trips cleanly.
+#   - Startup reconciliation marks any RUNNING row whose updated_at is
+#     older than _STALE_RUN_AGE_S as FAILED with a clear error message.
+#     This is the orphan cleanup that makes restart-during-run safe.
+# ---------------------------------------------------------------------------
+
+# Runs older than this with status='RUNNING' are presumed orphaned by an
+# app restart. 15 min covers the worst-case research run; longer-running
+# jobs (table enrichment) live in Databricks anyway and are tracked via
+# their databricks_run_id, so this only matters for inline threads.
+_STALE_RUN_AGE_S = 900
+
+
+def _upsert_run(run_id: str, **fields) -> None:
+    """Write-through update for a job run record.
+
+    Updates the in-memory `_active_runs[run_id]` dict AND merges the
+    same field set into `bhe_silver.job_runs`. Always sets `updated_at`
+    to current time so startup reconciliation can detect stale rows.
+
+    Use this anywhere you'd previously have written to `_active_runs`
+    directly. Existing direct dict writes have been migrated; new
+    runners should use this helper.
+    """
+    cur = _active_runs.setdefault(run_id, {})
+    cur.update(fields)
+    cur["updated_at"] = datetime.utcnow().isoformat()
+    # The run_id is the dict KEY, not stored as a field — but the MERGE
+    # SELECT needs it as a column value. Inject it here so `_v("run_id")`
+    # returns the actual id and every row gets a valid PK. Without this,
+    # all rows MERGE on `t.run_id = '' = s.run_id` and collapse to a
+    # single empty-key row.
+    cur["run_id"] = run_id
+
+    try:
+        silver = get_silver_schema()
+        tbl = fqn(silver, "job_runs")
+        # Build a VALUES tuple that mirrors the table schema. Use empty
+        # string for missing optional columns so MERGE has stable types.
+        cols = [
+            "run_id", "job_type", "status", "start_time", "end_time",
+            "error", "databricks_job_id", "databricks_run_id",
+            "company_name",
+        ]
+        def _v(k: str) -> str:
+            v = cur.get(k)
+            if v is None:
+                return "''"
+            return f"'{_sql_escape(str(v))}'"
+
+        select_list = ", ".join(f"{_v(c)} AS {c}" for c in cols)
+        # COALESCE+NULLIF preserves prior column values when this call
+        # didn't pass that field — important since most callers update
+        # only a subset (e.g. just status+end_time+error).
+        set_clauses = ", ".join(
+            f"t.{c} = COALESCE(NULLIF(s.{c}, ''), t.{c})"
+            for c in cols if c != "run_id"
+        )
+        insert_cols = ", ".join(cols) + ", updated_at"
+        insert_vals = ", ".join(f"s.{c}" for c in cols) + ", s.updated_at"
+        execute_query(f"""
+            MERGE INTO {tbl} AS t
+            USING (SELECT {select_list}, current_timestamp() AS updated_at) AS s
+            ON t.run_id = s.run_id
+            WHEN MATCHED THEN UPDATE SET {set_clauses}, t.updated_at = s.updated_at
+            WHEN NOT MATCHED THEN INSERT ({insert_cols}) VALUES ({insert_vals})
+        """)
+    except Exception as e:
+        # Persistence is best-effort; the in-memory copy still works
+        # for the lifetime of this process. Log so we notice if the
+        # table goes missing in production.
+        logger.warning(f"_upsert_run({run_id}) persist failed: {e}")
+
+
+def _get_run(run_id: str) -> dict | None:
+    """Return the run record from the cache, falling back to the table.
+
+    On hit from the table, the row is hydrated into `_active_runs` so
+    subsequent polls don't re-query. Returns None if the run_id is
+    unknown to both layers (genuine 404).
+    """
+    if run_id in _active_runs:
+        return _active_runs[run_id]
+    try:
+        silver = get_silver_schema()
+        tbl = fqn(silver, "job_runs")
+        rows = execute_query(
+            f"SELECT * FROM {tbl} WHERE run_id = '{_sql_escape(run_id)}' LIMIT 1"
+        )
+        if not rows:
+            return None
+        r = rows[0]
+        hydrated = {
+            "status": r.get("status") or "UNKNOWN",
+            "start_time": r.get("start_time"),
+            "end_time": r.get("end_time"),
+            "error": r.get("error"),
+            "job_type": r.get("job_type"),
+            "databricks_job_id": r.get("databricks_job_id"),
+            "databricks_run_id": r.get("databricks_run_id"),
+            "company_name": r.get("company_name"),
+        }
+        # Map databricks_run_id back to db_run_id for the existing
+        # job_status() reconciliation path that polls the Jobs API.
+        if hydrated["databricks_run_id"]:
+            hydrated["db_run_id"] = hydrated["databricks_run_id"]
+        _active_runs[run_id] = hydrated
+        return hydrated
+    except Exception as e:
+        logger.warning(f"_get_run({run_id}) fallback read failed: {e}")
+        return None
+
+
+def reconcile_stale_runs() -> int:
+    """Mark RUNNING rows older than _STALE_RUN_AGE_S as FAILED (orphan cleanup).
+
+    Called at app startup. Inline-thread jobs lose their thread when the
+    process dies; without this, their job_runs row stays RUNNING forever
+    and the UI's status poll never resolves. Returns the number of rows
+    marked as orphaned.
+    """
+    try:
+        silver = get_silver_schema()
+        tbl = fqn(silver, "job_runs")
+        result = execute_query(f"""
+            UPDATE {tbl}
+            SET status = 'FAILED',
+                error = 'App restarted while running; run state lost',
+                end_time = date_format(current_timestamp(), "yyyy-MM-dd'T'HH:mm:ss"),
+                updated_at = current_timestamp()
+            WHERE status IN ('RUNNING', 'PENDING')
+              AND updated_at < current_timestamp() - INTERVAL {_STALE_RUN_AGE_S} SECONDS
+        """)
+        # UPDATE doesn't reliably return row counts via the SQL API,
+        # so just log success.
+        logger.info("reconcile_stale_runs: marked stale RUNNING rows as FAILED")
+        return 0
+    except Exception as e:
+        logger.warning(f"reconcile_stale_runs failed (table may not exist yet): {e}")
+        return 0
+
 LLM_ENDPOINT = os.environ.get("LLM_ENDPOINT", "databricks-claude-sonnet-4")
 
 
@@ -5353,7 +6354,7 @@ def _run_company_research(
         return True
 
     try:
-        _active_runs[run_id]["status"] = "RUNNING"
+        _upsert_run(run_id, status="RUNNING")
 
         # ------------------------------------------------------------------
         # Short-circuit when the user clicks "Resume Research" but every
@@ -5387,8 +6388,7 @@ def _run_company_research(
         if not force and all_present:
             _log("All requested steps already complete; skipping run "
                  "(pass force=true to re-generate).")
-            _active_runs[run_id]["status"] = "TERMINATED"
-            _active_runs[run_id]["end_time"] = datetime.utcnow().isoformat()
+            _upsert_run(run_id, status="TERMINATED", end_time=datetime.utcnow().isoformat())
             return
 
         execute_query(
@@ -5662,17 +6662,14 @@ def _run_company_research(
         # company-research re-runs so any data the user generated through
         # the chat (or earlier company-research runs) is preserved.
 
-        _active_runs[run_id]["status"] = "TERMINATED"
-        _active_runs[run_id]["end_time"] = datetime.utcnow().isoformat()
+        _upsert_run(run_id, status="TERMINATED", end_time=datetime.utcnow().isoformat())
         _log("Company research complete!")
 
     except Exception as e:
         import traceback
         _log(f"Company research FAILED: {e}")
         traceback.print_exc()
-        _active_runs[run_id]["status"] = "FAILED"
-        _active_runs[run_id]["error"] = str(e)
-        _active_runs[run_id]["end_time"] = datetime.utcnow().isoformat()
+        _upsert_run(run_id, status="FAILED", error=str(e), end_time=datetime.utcnow().isoformat())
 
 
 def _run_enrichment(run_id: str, batch_size: int = 200):
@@ -5722,7 +6719,7 @@ def _run_enrichment(run_id: str, batch_size: int = 200):
     )
 
     try:
-        _active_runs[run_id]["status"] = "RUNNING"
+        _upsert_run(run_id, status="RUNNING")
         _log("Starting AI enrichment of schema_inventory...")
 
         count_rows = execute_query(f"""
@@ -5734,8 +6731,7 @@ def _run_enrichment(run_id: str, batch_size: int = 200):
         _log(f"Found {to_enrich} unenriched schemas (will process up to {batch_size})")
 
         if to_enrich == 0:
-            _active_runs[run_id]["status"] = "TERMINATED"
-            _active_runs[run_id]["end_time"] = datetime.utcnow().isoformat()
+            _upsert_run(run_id, status="TERMINATED", end_time=datetime.utcnow().isoformat())
             _log("No schemas to enrich.")
             return
 
@@ -5818,16 +6814,13 @@ def _run_enrichment(run_id: str, batch_size: int = 200):
         )
         _log(f"Enrichment complete. Total enriched in inventory: {total_enriched[0]['cnt'] if total_enriched else 0}")
 
-        _active_runs[run_id]["status"] = "TERMINATED"
-        _active_runs[run_id]["end_time"] = datetime.utcnow().isoformat()
+        _upsert_run(run_id, status="TERMINATED", end_time=datetime.utcnow().isoformat())
 
     except Exception as e:
         import traceback
         _log(f"Enrichment FAILED: {e}")
         traceback.print_exc()
-        _active_runs[run_id]["status"] = "FAILED"
-        _active_runs[run_id]["error"] = str(e)
-        _active_runs[run_id]["end_time"] = datetime.utcnow().isoformat()
+        _upsert_run(run_id, status="FAILED", error=str(e), end_time=datetime.utcnow().isoformat())
 
 
 @router.get("/jobs/pipeline-status", operation_id="pipelineStatus")
@@ -5909,12 +6902,14 @@ async def pipeline_status() -> dict:
 async def trigger_enrich_job(batch_size: int = Query(1000)) -> JobTriggerOut:
     """Enrich un-enriched schemas using ai_query() serverless batch inference."""
     run_id = str(uuid.uuid4())[:8]
-    _active_runs[run_id] = {
-        "status": "PENDING",
-        "start_time": datetime.utcnow().isoformat(),
-        "end_time": None,
-        "error": None,
-    }
+    _upsert_run(
+        run_id,
+        status="PENDING",
+        start_time=datetime.utcnow().isoformat(),
+        end_time=None,
+        error=None,
+        job_type="enrich-schemas",
+    )
     thread = threading.Thread(
         target=_run_enrichment, args=(run_id, batch_size), daemon=True
     )
@@ -5964,7 +6959,7 @@ def _run_table_enrichment(run_id: str, schema_name: str, batch_size: int = 100):
         schema_filter = f"AND t.table_schema = '{esc_schema}'"
 
     try:
-        _active_runs[run_id]["status"] = "RUNNING"
+        _upsert_run(run_id, status="RUNNING")
         _log(f"Starting table enrichment{' for schema ' + schema_name if schema_name else ''}...")
 
         count_rows = execute_query(f"""
@@ -5978,8 +6973,7 @@ def _run_table_enrichment(run_id: str, schema_name: str, batch_size: int = 100):
         _log(f"Found {to_enrich} unenriched tables (will process up to {batch_size})")
 
         if to_enrich == 0:
-            _active_runs[run_id]["status"] = "TERMINATED"
-            _active_runs[run_id]["end_time"] = datetime.utcnow().isoformat()
+            _upsert_run(run_id, status="TERMINATED", end_time=datetime.utcnow().isoformat())
             _log("No tables to enrich.")
             return
 
@@ -6050,16 +7044,13 @@ def _run_table_enrichment(run_id: str, schema_name: str, batch_size: int = 100):
         )
         _log(f"Table enrichment complete. Total enriched: {total_enriched[0]['cnt'] if total_enriched else 0}")
 
-        _active_runs[run_id]["status"] = "TERMINATED"
-        _active_runs[run_id]["end_time"] = datetime.utcnow().isoformat()
+        _upsert_run(run_id, status="TERMINATED", end_time=datetime.utcnow().isoformat())
 
     except Exception as e:
         import traceback
         _log(f"Table enrichment FAILED: {e}")
         traceback.print_exc()
-        _active_runs[run_id]["status"] = "FAILED"
-        _active_runs[run_id]["error"] = str(e)
-        _active_runs[run_id]["end_time"] = datetime.utcnow().isoformat()
+        _upsert_run(run_id, status="FAILED", error=str(e), end_time=datetime.utcnow().isoformat())
 
 
 def _find_databricks_job(name_match: str) -> dict | None:
@@ -6097,14 +7088,16 @@ def _trigger_databricks_job(
     db = DatabricksClient()
     result = db.jobs.run_now(job_id, python_params=python_params)
     db_run_id = str(result.get("run_id", ""))
-    _active_runs[db_run_id] = {
-        "status": "RUNNING",
-        "start_time": datetime.utcnow().isoformat(),
-        "end_time": None,
-        "error": None,
-        "databricks_job_id": job_id,
-        "databricks_run_id": result.get("run_id"),
-    }
+    _upsert_run(
+        db_run_id,
+        status="RUNNING",
+        start_time=datetime.utcnow().isoformat(),
+        end_time=None,
+        error=None,
+        databricks_job_id=str(job_id),
+        databricks_run_id=str(result.get("run_id", "")),
+        job_type="orphan-job",
+    )
     return JobTriggerOut(run_id=db_run_id, job_id=str(job_id), status="RUNNING")
 
 
@@ -6128,6 +7121,30 @@ def _status_databricks_job(name_match: str) -> dict:
     state = run.get("state", {})
     life_cycle = state.get("life_cycle_state", "UNKNOWN")
     result_state = state.get("result_state", "")
+
+    # Write-through completion to bhe_silver.job_runs so the orphan-job
+    # mirror doesn't get stuck at status=RUNNING (B-009 followup, mirrors
+    # the same logic added to table_enrich_job_status).
+    try:
+        db_run_id = str(run.get("run_id", ""))
+        if db_run_id and life_cycle == "TERMINATED":
+            mapped = "TERMINATED" if result_state == "SUCCESS" else "FAILED"
+            _upsert_run(
+                db_run_id,
+                status=mapped,
+                end_time=datetime.utcnow().isoformat(),
+                error=("" if result_state == "SUCCESS" else state.get("state_message", "")),
+            )
+        elif db_run_id and life_cycle in ("INTERNAL_ERROR", "SKIPPED"):
+            _upsert_run(
+                db_run_id,
+                status="FAILED",
+                end_time=datetime.utcnow().isoformat(),
+                error=state.get("state_message", ""),
+            )
+    except Exception as e:
+        logger.warning(f"job_runs write-through (_status_databricks_job) failed: {e}")
+
     return {
         "status": result_state or life_cycle,
         "life_cycle_state": life_cycle,
@@ -6144,8 +7161,16 @@ def _status_databricks_job(name_match: str) -> dict:
 async def trigger_table_enrich_job(
     batch_size: int = Query(200),
     max_batches: int = Query(500),
+    schema_name: Optional[str] = Query(None, description="Optional: limit enrichment to a single schema_name"),
 ) -> JobTriggerOut:
-    """Submit the table enrichment job to Databricks (runs independently)."""
+    """Submit the table enrichment job to Databricks (runs independently).
+
+    NOTE: `db.jobs.run_now(python_params=...)` REPLACES the bundle's YAML
+    `parameters` list — it does not merge. So we must pass the full arg set
+    here (catalog/silver/gold/company), not just the overrides. Otherwise
+    the script falls back to its argparse defaults (`your_catalog`, etc.)
+    and fails with INSUFFICIENT_PERMISSIONS.
+    """
     db = DatabricksClient()
     JOB_NAME = "BHE AI Table Enrichment"
     jobs = db.jobs.list(name="Table Enrichment")
@@ -6156,19 +7181,37 @@ async def trigger_table_enrich_job(
     if not matched:
         raise HTTPException(404, f"Databricks job containing '{JOB_NAME}' not found")
     job_id = matched[0]["job_id"]
-    result = db.jobs.run_now(job_id, python_params=[
+
+    catalog = get_catalog()
+    silver = get_silver_schema()
+    gold = get_gold_schema()
+    company = _get_company_name() or "the company"
+
+    params = [
+        "--catalog", catalog,
+        "--silver-schema", silver,
+        "--gold-schema", gold,
+        "--company-name", company,
+        # batch-size / max-batches are deprecated no-ops in the staged job
+        # but kept for telemetry / parity with the YAML.
         "--batch-size", str(batch_size),
         "--max-batches", str(max_batches),
-    ])
+    ]
+    if schema_name:
+        params.extend(["--schema-name", schema_name])
+
+    result = db.jobs.run_now(job_id, python_params=params)
     db_run_id = str(result.get("run_id", ""))
-    _active_runs[db_run_id] = {
-        "status": "RUNNING",
-        "start_time": datetime.utcnow().isoformat(),
-        "end_time": None,
-        "error": None,
-        "databricks_job_id": job_id,
-        "databricks_run_id": result.get("run_id"),
-    }
+    _upsert_run(
+        db_run_id,
+        status="RUNNING",
+        start_time=datetime.utcnow().isoformat(),
+        end_time=None,
+        error=None,
+        databricks_job_id=str(job_id),
+        databricks_run_id=str(result.get("run_id", "")),
+        job_type="enrich-tables",
+    )
     return JobTriggerOut(run_id=db_run_id, job_id=str(job_id), status="RUNNING")
 
 
@@ -6193,6 +7236,32 @@ async def table_enrich_job_status() -> dict:
     state = run.get("state", {})
     life_cycle = state.get("life_cycle_state", "UNKNOWN")
     result_state = state.get("result_state", "")
+
+    # Write-through to bhe_silver.job_runs so the durable mirror catches
+    # the completion (B-009 followup). Without this, orphan-job rows stay
+    # at status=RUNNING in the table forever — Databricks owns the source
+    # of truth for these runs but the mirror still wants to be eventually
+    # consistent. Best-effort: a failure here doesn't break status reads.
+    try:
+        db_run_id = str(run.get("run_id", ""))
+        if db_run_id and life_cycle == "TERMINATED":
+            mapped = "TERMINATED" if result_state == "SUCCESS" else "FAILED"
+            _upsert_run(
+                db_run_id,
+                status=mapped,
+                end_time=datetime.utcnow().isoformat(),
+                error=("" if result_state == "SUCCESS" else state.get("state_message", "")),
+            )
+        elif db_run_id and life_cycle in ("INTERNAL_ERROR", "SKIPPED"):
+            _upsert_run(
+                db_run_id,
+                status="FAILED",
+                end_time=datetime.utcnow().isoformat(),
+                error=state.get("state_message", ""),
+            )
+    except Exception as e:
+        logger.warning(f"job_runs write-through (status_databricks_job) failed: {e}")
+
     return {
         "status": result_state or life_cycle,
         "life_cycle_state": life_cycle,
@@ -6472,13 +7541,15 @@ async def trigger_company_research(body: CompanyResearchIn) -> JobTriggerOut:
 
     if not matched:
         run_id = str(uuid.uuid4())[:8]
-        _active_runs[run_id] = {
-            "status": "PENDING",
-            "start_time": datetime.utcnow().isoformat(),
-            "end_time": None,
-            "error": None,
-            "job_type": "company-research",
-        }
+        _upsert_run(
+            run_id,
+            status="PENDING",
+            start_time=datetime.utcnow().isoformat(),
+            end_time=None,
+            error=None,
+            job_type="company-research",
+            company_name=body.company_name,
+        )
         # Pass the resolved steps + force flag so the inline runner honors
         # them. Previously these were dropped on the floor for the inline
         # path, which made `Resume Research` always re-run every step.
@@ -6505,24 +7576,34 @@ async def trigger_company_research(body: CompanyResearchIn) -> JobTriggerOut:
         python_params.append("--force")
     result = db.jobs.run_now(job_id, python_params=python_params)
     db_run_id = str(result.get("run_id", ""))
-    _active_runs[run_id] = {
-        "status": "RUNNING",
-        "start_time": datetime.utcnow().isoformat(),
-        "end_time": None,
-        "error": None,
-        "job_type": "company-research",
-        "db_run_id": db_run_id,
-    }
+    _upsert_run(
+        run_id,
+        status="RUNNING",
+        start_time=datetime.utcnow().isoformat(),
+        end_time=None,
+        error=None,
+        job_type="company-research",
+        databricks_job_id=str(job_id),
+        databricks_run_id=db_run_id,
+        company_name=body.company_name,
+    )
+    # Also keep db_run_id alias on the in-memory record for the legacy
+    # job_status() reconciliation path that polls Databricks via
+    # `run.get("db_run_id")`.
+    _active_runs[run_id]["db_run_id"] = db_run_id
     return JobTriggerOut(run_id=run_id, job_id=str(job_id), status="RUNNING")
 
 
 @router.get("/jobs/{run_id}/status", operation_id="jobStatus")
 async def job_status(run_id: str) -> JobStatusOut:
-    run = _active_runs.get(run_id)
+    # B-009: cache → table fallback. After an app restart the in-memory
+    # dict is cold but the durable mirror still has the row, so the UI's
+    # status poll resolves cleanly instead of hanging on a 404.
+    run = _get_run(run_id)
     if not run:
         raise HTTPException(404, f"Run {run_id} not found")
 
-    db_run_id = run.get("db_run_id")
+    db_run_id = run.get("db_run_id") or run.get("databricks_run_id")
     if db_run_id and run.get("status") in ("RUNNING", "PENDING"):
         try:
             db = DatabricksClient()
@@ -6531,14 +7612,22 @@ async def job_status(run_id: str) -> JobStatusOut:
             lcs = state.get("life_cycle_state")
             rs = state.get("result_state")
             if lcs == "TERMINATED":
-                run["status"] = "TERMINATED" if rs == "SUCCESS" else "FAILED"
-                run["end_time"] = datetime.utcnow().isoformat()
-                if rs != "SUCCESS":
-                    run["error"] = state.get("state_message", "")
+                new_status = "TERMINATED" if rs == "SUCCESS" else "FAILED"
+                _upsert_run(
+                    run_id,
+                    status=new_status,
+                    end_time=datetime.utcnow().isoformat(),
+                    error=("" if rs == "SUCCESS" else state.get("state_message", "")),
+                )
+                run = _active_runs[run_id]
             elif lcs in ("INTERNAL_ERROR", "SKIPPED"):
-                run["status"] = "FAILED"
-                run["end_time"] = datetime.utcnow().isoformat()
-                run["error"] = state.get("state_message", "")
+                _upsert_run(
+                    run_id,
+                    status="FAILED",
+                    end_time=datetime.utcnow().isoformat(),
+                    error=state.get("state_message", ""),
+                )
+                run = _active_runs[run_id]
         except Exception as e:
             logger.warning(f"Failed to check Databricks run state: {e}")
 
@@ -6587,6 +7676,7 @@ async def job_progress(run_id: str) -> dict:
                             db_run_id = str(r.get("run_id", ""))
                             run_page_url = r.get("run_page_url", "") or ""
                             if run_id in _active_runs:
+                                _upsert_run(run_id, databricks_run_id=db_run_id)
                                 _active_runs[run_id]["db_run_id"] = db_run_id
                             break
                     if db_run_id:
@@ -6780,8 +7870,19 @@ async def ingest_schemas(filename: str = Query("all_schemas_dbrk.csv")):
     target = fqn(silver, "silver_schemas")
 
     _ensure_silver_table_exists("silver_schemas")
+    _ensure_silver_schemas_columns()
 
     try:
+        # Dedup the source on (catalog_name, schema_name) — the multi-workspace
+        # extractor produces 1 row per (workspace, catalog, schema), and the
+        # same logical schema (e.g. `samples.bakehouse`) shows up in every
+        # workspace. The MERGE key is just (catalog, schema), so without
+        # dedup Spark raises DELTA_MULTIPLE_SOURCE_ROW_MATCHING_TARGET_ROW.
+        # Pick the most-recently-altered occurrence; ties broken by
+        # workspace_url for determinism. workspace_url stored on the row is
+        # therefore "the workspace that most recently touched this schema".
+        # workspace_count is computed BEFORE dedup so it reflects how many
+        # workspaces saw this logical schema in the bronze extract.
         execute_query(f"""
             MERGE INTO {target} AS t
             USING (
@@ -6793,6 +7894,7 @@ async def ingest_schemas(filename: str = Query("all_schemas_dbrk.csv")):
                 COALESCE(created, '') AS created,
                 COALESCE(last_altered, '') AS last_altered,
                 COALESCE(workspace_url, '') AS workspace_url,
+                workspace_count,
                 CASE
                   WHEN lower(catalog_name) LIKE '__databricks%' OR lower(catalog_name) IN ('system','samples') THEN 'SYSTEM'
                   WHEN lower(catalog_name) RLIKE '_dev[0-9]{{2}}_' THEN 'DEV'
@@ -6812,17 +7914,14 @@ async def ingest_schemas(filename: str = Query("all_schemas_dbrk.csv")):
                   WHEN lower(catalog_name) LIKE '%oracle%' OR lower(catalog_name) LIKE '%sqlserver%' THEN 'FEDERATED'
                   ELSE 'OTHER'
                 END AS zone,
-                CASE
-                  WHEN lower(catalog_name) LIKE 'apm_%' THEN 'Asset Performance Management'
-                  WHEN lower(catalog_name) LIKE 'bhermred_%' THEN 'BHE Renewable Energy'
-                  WHEN lower(catalog_name) LIKE 'fdm_%' THEN 'Financial Data Management'
-                  WHEN lower(catalog_name) LIKE 'gtsdl_%' THEN 'GTS Data Lake'
-                  WHEN lower(catalog_name) LIKE 'nvedl_%' THEN 'NV Energy Data Lake'
-                  WHEN lower(catalog_name) LIKE 'pac_%' THEN 'PacifiCorp'
-                  WHEN lower(catalog_name) LIKE 'trp_%' THEN 'Transmission & Reliability Planning'
-                  WHEN lower(catalog_name) LIKE 'whub_%' THEN 'Western Hub'
-                  ELSE 'Unknown'
-                END AS program,
+                -- Program is intentionally NOT hardcoded here (closes
+                -- circular dep E, 2026-05-05). The label is derived by
+                -- populate_gold from the editable
+                -- `bhe_gold.classification_rules` table and backfilled
+                -- into silver_schemas at the end of populate_gold. Until
+                -- populate_gold runs (or for catalogs unmatched by any
+                -- rule), rows show 'Unknown'.
+                CAST('Unknown' AS STRING) AS program,
                 CASE
                   WHEN lower(catalog_name) LIKE '__databricks%' THEN 'INTERNAL'
                   WHEN lower(schema_name) = 'information_schema' THEN 'SYSTEM'
@@ -6831,28 +7930,39 @@ async def ingest_schemas(filename: str = Query("all_schemas_dbrk.csv")):
                   WHEN lower(schema_name) LIKE 'wflw_%' THEN 'MIGRATION'
                   ELSE 'PRODUCTION'
                 END AS classification
-              FROM read_files('{vol_path}', format => 'csv', header => true, multiLine => true, escape => '"')
+              FROM (
+                SELECT *,
+                       COUNT(*) OVER (PARTITION BY catalog_name, schema_name) AS workspace_count,
+                       ROW_NUMBER() OVER (
+                         PARTITION BY catalog_name, schema_name
+                         ORDER BY COALESCE(last_altered, '') DESC,
+                                  COALESCE(workspace_url, '') ASC
+                       ) AS _rn
+                FROM read_files('{vol_path}', format => 'csv', header => true, multiLine => true, escape => '"')
+                WHERE catalog_name IS NOT NULL AND schema_name IS NOT NULL
+              ) WHERE _rn = 1
             ) AS s
             ON  t.catalog_name = s.catalog_name
             AND t.schema_name  = s.schema_name
             WHEN MATCHED AND COALESCE(t.is_user_edited, false) = false THEN UPDATE SET
-              t.schema_owner   = s.schema_owner,
-              t.comment        = s.comment,
-              t.created        = s.created,
-              t.last_altered   = s.last_altered,
-              t.workspace_url  = s.workspace_url,
-              t.environment    = s.environment,
-              t.zone           = s.zone,
-              t.program        = s.program,
-              t.classification = s.classification
+              t.schema_owner    = s.schema_owner,
+              t.comment         = s.comment,
+              t.created         = s.created,
+              t.last_altered    = s.last_altered,
+              t.workspace_url   = s.workspace_url,
+              t.workspace_count = s.workspace_count,
+              t.environment     = s.environment,
+              t.zone            = s.zone,
+              t.program         = s.program,
+              t.classification  = s.classification
             WHEN NOT MATCHED THEN INSERT (
               catalog_name, schema_name, schema_owner, comment, created, last_altered,
-              workspace_url, environment, zone, program, classification,
+              workspace_url, workspace_count, environment, zone, program, classification,
               ai_definition, business_friendly_name, suggested_department, suggested_domain,
               data_sensitivity, is_user_edited, user_edited_at
             ) VALUES (
               s.catalog_name, s.schema_name, s.schema_owner, s.comment, s.created, s.last_altered,
-              s.workspace_url, s.environment, s.zone, s.program, s.classification,
+              s.workspace_url, s.workspace_count, s.environment, s.zone, s.program, s.classification,
               '', '', '', '',
               '', false, ''
             )
@@ -6879,8 +7989,16 @@ async def ingest_tables(filename: str = Query("all_tables_dbrk.csv")):
     target = fqn(silver, "silver_tables")
 
     _ensure_silver_table_exists("silver_tables")
+    _ensure_silver_tables_columns()
 
     try:
+        # Dedup on (catalog, schema, table) — see ingest_schemas for the same
+        # rationale. Multi-workspace extracts have shared catalogs (samples,
+        # *_dev*, etc.) repeated across workspaces; without dedup the MERGE
+        # raises DELTA_MULTIPLE_SOURCE_ROW_MATCHING_TARGET_ROW. Pick the
+        # most-recently-altered occurrence. workspace_count is computed
+        # BEFORE dedup so it reflects how many workspaces saw this logical
+        # table in the bronze extract.
         execute_query(f"""
             MERGE INTO {target} AS t
             USING (
@@ -6893,8 +8011,21 @@ async def ingest_tables(filename: str = Query("all_tables_dbrk.csv")):
                 COALESCE(comment, '') AS comment,
                 COALESCE(created, '') AS created,
                 COALESCE(last_altered, '') AS last_altered,
-                COALESCE(data_source_format, '') AS data_source_format
-              FROM read_files('{vol_path}', format => 'csv', header => true, multiLine => true, escape => '"')
+                COALESCE(data_source_format, '') AS data_source_format,
+                workspace_count
+              FROM (
+                SELECT *,
+                       COUNT(*) OVER (
+                         PARTITION BY table_catalog, table_schema, table_name
+                       ) AS workspace_count,
+                       ROW_NUMBER() OVER (
+                         PARTITION BY table_catalog, table_schema, table_name
+                         ORDER BY COALESCE(last_altered, '') DESC,
+                                  COALESCE(workspace_url, '') ASC
+                       ) AS _rn
+                FROM read_files('{vol_path}', format => 'csv', header => true, multiLine => true, escape => '"')
+                WHERE table_catalog IS NOT NULL AND table_schema IS NOT NULL AND table_name IS NOT NULL
+              ) WHERE _rn = 1
             ) AS s
             ON  t.table_catalog = s.table_catalog
             AND t.table_schema  = s.table_schema
@@ -6905,16 +8036,19 @@ async def ingest_tables(filename: str = Query("all_tables_dbrk.csv")):
               t.comment            = s.comment,
               t.created            = s.created,
               t.last_altered       = s.last_altered,
-              t.data_source_format = s.data_source_format
+              t.data_source_format = s.data_source_format,
+              t.workspace_count    = s.workspace_count
             WHEN NOT MATCHED THEN INSERT (
               table_catalog, table_schema, table_name,
               table_type, table_owner, comment, created, last_altered, data_source_format,
+              workspace_count,
               classification, ai_definition, business_friendly_name,
               is_user_edited, user_edited_at,
               source_system, source_system_canonical
             ) VALUES (
               s.table_catalog, s.table_schema, s.table_name,
               s.table_type, s.table_owner, s.comment, s.created, s.last_altered, s.data_source_format,
+              s.workspace_count,
               'PRODUCTION', '', '',
               false, '',
               CAST(NULL AS STRING), CAST(NULL AS STRING)
@@ -7099,7 +8233,7 @@ def _run_populate_gold(run_id: str):
     gold = get_gold_schema()
 
     try:
-        _active_runs[run_id]["status"] = "RUNNING"
+        _upsert_run(run_id, status="RUNNING")
 
         # Load rules from DB
         _log("Loading classification rules...")
@@ -7262,6 +8396,49 @@ def _run_populate_gold(run_id: str):
         inv_cnt = execute_query(f"SELECT count(*) as cnt FROM {fqn(gold, 'schema_inventory')}")
         _log(f"schema_inventory populated: {inv_cnt[0]['cnt'] if inv_cnt else 0} rows (skipped {skipped} by ignore rules; LLM enrichment preserved across re-runs)")
 
+        # Step 1.5: backfill silver_schemas.program from the rules-derived
+        # gold.schema_inventory (closes circular dep E, 2026-05-05). The
+        # ingest path now sets silver_schemas.program='Unknown' instead
+        # of using hardcoded BHE patterns; this MERGE is what makes the
+        # catalog browser show the correct, customer-configurable
+        # program label.
+        #
+        # We pull the FRIENDLY label from `schema_inventory.workspace_name`
+        # (which is rules.label, e.g. "Asset Performance Management"),
+        # NOT `schema_inventory.program` (which is rules.pattern, e.g.
+        # "apm"). Catalog browser users see the friendly label; the
+        # short pattern stays inside the gold layer.
+        #
+        # `silver_schemas` is keyed by (catalog_name, schema_name) but
+        # `schema_inventory` is keyed by (workspace_id, catalog_name,
+        # schema_name) — same schema appearing across dev/qa/prod
+        # workspaces would otherwise trip Delta's
+        # DELTA_MULTIPLE_SOURCE_ROW_MATCHING_TARGET_ROW_IN_MERGE. Rules
+        # are deterministic on catalog_name, so MAX(workspace_name) is
+        # safe (all rows share the same friendly label).
+        #
+        # Skips user-edited rows so analyst overrides persist. The
+        # `program != COALESCE(t.program,'')` guard avoids no-op writes.
+        try:
+            _log("Step 1.5/4: Backfilling silver_schemas.program from rules-derived schema_inventory...")
+            execute_query(f"""
+                MERGE INTO {fqn(silver, 'silver_schemas')} AS t
+                USING (
+                    SELECT catalog_name,
+                           schema_name,
+                           COALESCE(NULLIF(MAX(workspace_name), ''), 'Unknown') AS program
+                    FROM {fqn(gold, 'schema_inventory')}
+                    GROUP BY catalog_name, schema_name
+                ) AS s
+                ON  t.catalog_name = s.catalog_name
+                AND t.schema_name  = s.schema_name
+                WHEN MATCHED AND COALESCE(t.is_user_edited, false) = false
+                                AND COALESCE(t.program, '') != s.program THEN
+                    UPDATE SET t.program = s.program
+            """)
+        except Exception as e:
+            _log(f"  silver_schemas.program backfill skipped ({e})")
+
         _log("Step 2/4: Populating source_summary...")
         execute_query(f"DELETE FROM {fqn(gold, 'source_summary')} WHERE 1=1")
         execute_query(f"""
@@ -7397,29 +8574,28 @@ def _run_populate_gold(run_id: str):
         except Exception as e:
             _log(f"artifact_summary skipped: {e}")
 
-        _active_runs[run_id]["status"] = "TERMINATED"
-        _active_runs[run_id]["end_time"] = datetime.utcnow().isoformat()
+        _upsert_run(run_id, status="TERMINATED", end_time=datetime.utcnow().isoformat())
         _log("Gold layer population complete!")
 
     except Exception as e:
         import traceback
         _log(f"Gold population FAILED: {e}")
         traceback.print_exc()
-        _active_runs[run_id]["status"] = "FAILED"
-        _active_runs[run_id]["error"] = str(e)
-        _active_runs[run_id]["end_time"] = datetime.utcnow().isoformat()
+        _upsert_run(run_id, status="FAILED", error=str(e), end_time=datetime.utcnow().isoformat())
 
 
 @router.post("/jobs/populate-gold", operation_id="triggerPopulateGold")
 async def trigger_populate_gold() -> JobTriggerOut:
     """Populate gold layer tables from silver data using rule-based derivation."""
     run_id = str(uuid.uuid4())[:8]
-    _active_runs[run_id] = {
-        "status": "PENDING",
-        "start_time": datetime.utcnow().isoformat(),
-        "end_time": None,
-        "error": None,
-    }
+    _upsert_run(
+        run_id,
+        status="PENDING",
+        start_time=datetime.utcnow().isoformat(),
+        end_time=None,
+        error=None,
+        job_type="populate-gold",
+    )
     thread = threading.Thread(
         target=_run_populate_gold, args=(run_id,), daemon=True
     )
@@ -7947,7 +9123,7 @@ def _run_taxonomy_generation(run_id: str, batch_size: int = 2000):
     )
 
     try:
-        _active_runs[run_id]["status"] = "RUNNING"
+        _upsert_run(run_id, status="RUNNING")
 
         count_rows = execute_query(f"""
             SELECT COUNT(*) as cnt
@@ -7960,8 +9136,7 @@ def _run_taxonomy_generation(run_id: str, batch_size: int = 2000):
         _log(f"Found {to_classify} unclassified schemas")
 
         if to_classify == 0:
-            _active_runs[run_id]["status"] = "TERMINATED"
-            _active_runs[run_id]["end_time"] = datetime.utcnow().isoformat()
+            _upsert_run(run_id, status="TERMINATED", end_time=datetime.utcnow().isoformat())
             _log("No schemas to classify.")
             return
 
@@ -8029,28 +9204,27 @@ def _run_taxonomy_generation(run_id: str, batch_size: int = 2000):
         )
         _log(f"Done. Total schemas classified: {total[0]['cnt'] if total else 0}")
 
-        _active_runs[run_id]["status"] = "TERMINATED"
-        _active_runs[run_id]["end_time"] = datetime.utcnow().isoformat()
+        _upsert_run(run_id, status="TERMINATED", end_time=datetime.utcnow().isoformat())
 
     except Exception as e:
         import traceback
         _log(f"Taxonomy generation FAILED: {e}")
         traceback.print_exc()
-        _active_runs[run_id]["status"] = "FAILED"
-        _active_runs[run_id]["error"] = str(e)
-        _active_runs[run_id]["end_time"] = datetime.utcnow().isoformat()
+        _upsert_run(run_id, status="FAILED", error=str(e), end_time=datetime.utcnow().isoformat())
 
 
 @router.post("/jobs/generate-taxonomy", operation_id="triggerTaxonomyGeneration")
 async def trigger_taxonomy_generation() -> JobTriggerOut:
     """Generate AI taxonomy classifications for unclassified schemas."""
     run_id = str(uuid.uuid4())[:8]
-    _active_runs[run_id] = {
-        "status": "PENDING",
-        "start_time": datetime.utcnow().isoformat(),
-        "end_time": None,
-        "error": None,
-    }
+    _upsert_run(
+        run_id,
+        status="PENDING",
+        start_time=datetime.utcnow().isoformat(),
+        end_time=None,
+        error=None,
+        job_type="generate-taxonomy",
+    )
     thread = threading.Thread(
         target=_run_taxonomy_generation, args=(run_id,), daemon=True
     )
@@ -8576,7 +9750,7 @@ def _run_taxonomy_reprocessing(run_id: str, batch_size: int = 2000):
     )
 
     try:
-        _active_runs[run_id]["status"] = "RUNNING"
+        _upsert_run(run_id, status="RUNNING")
 
         # --- Phase 1: Missing schemas (no taxonomy at all) ---
         missing_count = execute_query(f"""
@@ -8732,28 +9906,27 @@ def _run_taxonomy_reprocessing(run_id: str, batch_size: int = 2000):
         )
         _log(f"Done. Total schemas classified: {total[0]['cnt'] if total else 0}")
 
-        _active_runs[run_id]["status"] = "TERMINATED"
-        _active_runs[run_id]["end_time"] = datetime.utcnow().isoformat()
+        _upsert_run(run_id, status="TERMINATED", end_time=datetime.utcnow().isoformat())
 
     except Exception as e:
         import traceback
         _log(f"Reprocessing FAILED: {e}")
         traceback.print_exc()
-        _active_runs[run_id]["status"] = "FAILED"
-        _active_runs[run_id]["error"] = str(e)
-        _active_runs[run_id]["end_time"] = datetime.utcnow().isoformat()
+        _upsert_run(run_id, status="FAILED", error=str(e), end_time=datetime.utcnow().isoformat())
 
 
 @router.post("/jobs/reprocess-taxonomy", operation_id="triggerTaxonomyReprocessing")
 async def trigger_taxonomy_reprocessing() -> JobTriggerOut:
     """Reprocess taxonomy: fill missing schemas and fix invalid values."""
     run_id = str(uuid.uuid4())[:8]
-    _active_runs[run_id] = {
-        "status": "PENDING",
-        "start_time": datetime.utcnow().isoformat(),
-        "end_time": None,
-        "error": None,
-    }
+    _upsert_run(
+        run_id,
+        status="PENDING",
+        start_time=datetime.utcnow().isoformat(),
+        end_time=None,
+        error=None,
+        job_type="reprocess-taxonomy",
+    )
     thread = threading.Thread(
         target=_run_taxonomy_reprocessing, args=(run_id,), daemon=True
     )
@@ -9363,7 +10536,7 @@ def _run_artifact_enrichment(run_id: str, batch_size: int = 200):
     )
 
     try:
-        _active_runs[run_id]["status"] = "RUNNING"
+        _upsert_run(run_id, status="RUNNING")
         _log("Starting AI enrichment of silver_artifacts...")
 
         count_rows = execute_query(
@@ -9377,8 +10550,7 @@ def _run_artifact_enrichment(run_id: str, batch_size: int = 200):
         to_enrich = int(count_rows[0]["cnt"]) if count_rows else 0
         _log(f"Found {to_enrich} un-enriched artifacts (processing up to {batch_size})")
         if to_enrich == 0:
-            _active_runs[run_id]["status"] = "TERMINATED"
-            _active_runs[run_id]["end_time"] = datetime.utcnow().isoformat()
+            _upsert_run(run_id, status="TERMINATED", end_time=datetime.utcnow().isoformat())
             return
 
         sql = f"""
@@ -9435,16 +10607,13 @@ def _run_artifact_enrichment(run_id: str, batch_size: int = 200):
             f"SELECT COUNT(*) as cnt FROM {table} WHERE ai_summary != '' AND ai_summary IS NOT NULL"
         )
         _log(f"Artifact enrichment complete. Total enriched: {done[0]['cnt'] if done else 0}")
-        _active_runs[run_id]["status"] = "TERMINATED"
-        _active_runs[run_id]["end_time"] = datetime.utcnow().isoformat()
+        _upsert_run(run_id, status="TERMINATED", end_time=datetime.utcnow().isoformat())
 
     except Exception as e:
         import traceback
         _log(f"Artifact enrichment FAILED: {e}")
         traceback.print_exc()
-        _active_runs[run_id]["status"] = "FAILED"
-        _active_runs[run_id]["error"] = str(e)
-        _active_runs[run_id]["end_time"] = datetime.utcnow().isoformat()
+        _upsert_run(run_id, status="FAILED", error=str(e), end_time=datetime.utcnow().isoformat())
 
 
 @router.post("/jobs/enrich-artifacts", operation_id="triggerArtifactEnrichment")
@@ -9452,12 +10621,14 @@ async def trigger_artifact_enrichment(batch_size: int = Query(500, le=2000)) -> 
     """Kick off AI enrichment of silver_artifacts (ai_summary, ai_suggested_tags)."""
     _ensure_artifacts_table()
     run_id = str(uuid.uuid4())[:8]
-    _active_runs[run_id] = {
-        "status": "PENDING",
-        "start_time": datetime.utcnow().isoformat(),
-        "end_time": None,
-        "error": None,
-    }
+    _upsert_run(
+        run_id,
+        status="PENDING",
+        start_time=datetime.utcnow().isoformat(),
+        end_time=None,
+        error=None,
+        job_type="enrich-artifacts",
+    )
     thread = threading.Thread(
         target=_run_artifact_enrichment, args=(run_id, batch_size), daemon=True
     )

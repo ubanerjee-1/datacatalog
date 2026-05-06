@@ -325,8 +325,8 @@ const SILVER_TABLES: TableSpec[] = [
       "business_value",
       "data_requirements",
     ],
-    writtenBy: ["company_research.py"],
-    readBy: ["Value & Readiness", "/api/value/use-cases"],
+    writtenBy: ["/use-cases page (POST /use-cases/generate/commit)", "Edit Center"],
+    readBy: ["Value & Readiness", "/use-cases", "/api/value/use-cases"],
     llmDerived: true,
   },
   {
@@ -334,7 +334,7 @@ const SILVER_TABLES: TableSpec[] = [
     purpose:
       "Free-text data entities required by each use case (e.g. 'meter readings', 'outage tickets'). Pre-canonical: feeds the LLM prompt that produces use_case_source_requirements.",
     columns: ["use_case_id", "entity_name", "description"],
-    writtenBy: ["company_research.py"],
+    writtenBy: ["Edit Center (manual)"],
     readBy: ["build_value_model.py"],
     llmDerived: true,
   },
@@ -343,7 +343,7 @@ const SILVER_TABLES: TableSpec[] = [
     purpose:
       "Curated list of business departments at the customer (e.g. 'Power Delivery', 'Grid Operations'). Drives the Department slicer and provides the parent for use cases.",
     columns: ["id", "name", "description"],
-    writtenBy: ["company_research.py"],
+    writtenBy: ["Company Research (inline)", "Edit Center"],
     readBy: ["Value & Readiness", "Edit Center"],
     manualEdit: true,
   },
@@ -352,7 +352,7 @@ const SILVER_TABLES: TableSpec[] = [
     purpose:
       "Single-row table describing the company being analyzed (BHE), its industry, headquarters, and high-level business areas. Powers the Company Setup page.",
     columns: ["company_name", "industry", "description", "headquarters"],
-    writtenBy: ["company_research.py"],
+    writtenBy: ["Company Research (inline)", "Edit Center"],
     readBy: ["Company Setup", "/api/company/profile"],
     manualEdit: true,
   },
@@ -368,7 +368,7 @@ const SILVER_TABLES: TableSpec[] = [
       "department",
       "relevance",
     ],
-    writtenBy: ["company_research.py", "Edit Center"],
+    writtenBy: ["Edit Center (manual)"],
     readBy: ["Edit Center", "/api/sankey/mappings"],
     manualEdit: true,
   },
@@ -377,7 +377,7 @@ const SILVER_TABLES: TableSpec[] = [
     purpose:
       "Append-only event log for long-running LLM jobs (company research, AI enrichment). Drives the live progress tree in the UI.",
     columns: ["job_id", "ts", "level", "phase", "message", "payload"],
-    writtenBy: ["company_research.py", "ai_enrich_*.py"],
+    writtenBy: ["Company Research (inline)", "ai_enrich_*.py"],
     readBy: ["/api/jobs/progress"],
   },
 ];
@@ -386,9 +386,9 @@ const GOLD_TABLES: TableSpec[] = [
   {
     name: "source_system_canonical",
     purpose:
-      "The closed vocabulary of canonical source systems (e.g. 'SAP', 'PI Historian', 'OSIsoft Cloud'). Seeded from src/data/source_system_canonical_seed.csv and editable by the customer.",
+      "The closed vocabulary of canonical source systems (e.g. 'SAP ECC', 'PI Historian', 'Maximo'). LLM-derived from the customer's industry + the raw source-system labels observed in silver_tables; customer-editable via the Edit Center.",
     columns: ["canonical", "category", "description", "is_active"],
-    writtenBy: ["normalize_source_systems.py (seed_canonical stage)"],
+    writtenBy: ["normalize_source_systems.py (stage_llm_canonical)"],
     readBy: ["Source Systems", "Source ROI", "Sankey"],
     manualEdit: true,
   },
@@ -841,7 +841,7 @@ const JOBS: JobSpec[] = [
     purpose:
       "Folds the ~1,000 free-text source_system values produced by ai_enrich_tables onto the closed canonical list (~50 entries). Three-pass strategy: deterministic, LLM, manual.",
     stages: [
-      "seed_canonical - upsert canonical + alias seed CSVs",
+      "stage_llm_canonical - one ai_query derives the canonical source-system vocabulary from company industry + observed silver_tables raw values, MERGE into source_system_canonical + source_system_aliases (B-003 closure)",
       "extract_unmapped - distinct silver_tables.source_system values not yet in alias table",
       "apply_deterministic - exact + normalized matches",
       "apply_llm_fallback - single batched ai_query against canonical vocab",
@@ -858,28 +858,24 @@ const JOBS: JobSpec[] = [
     idempotent: true,
   },
   {
-    name: "company_research",
-    file: "src/jobs/company_research.py",
+    name: "company_research (inline)",
+    file: "src/app/src/bhe_catalog/backend/router.py::_run_company_research",
     purpose:
-      "Multi-step LLM workflow that researches the customer (BHE) and produces departments, use_cases (with $ values), use_case_entities, and the legacy sankey_mappings. Emits live progress to job_progress so the UI can show a real-time tree.",
+      "Multi-step LLM workflow that researches the customer and produces company_profile, departments, and affiliates. Runs in a FastAPI background thread (NOT a Databricks job) so the 3-step contract is single-sourced from the app. Emits live progress to job_progress for the UI tree. Use cases are now generated separately on the dedicated /use-cases page.",
     stages: [
-      "research company profile",
-      "generate 10-25 departments",
-      "generate 3-10 high-value use cases per department (with $ estimates)",
-      "generate required entities per use case",
-      "generate legacy Sankey mappings",
+      "research company profile (industry, sub-industry, headquarters, key business units)",
+      "generate departments (utility-shaped, with descriptions and data needs)",
+      "generate operating affiliates (closed list with regions/business types)",
     ],
     dependsOn: ["company name input"],
     writes: [
       "bhe_silver.company_profile",
       "bhe_silver.departments",
-      "bhe_silver.use_cases",
-      "bhe_silver.use_case_entities",
-      "bhe_silver.sankey_mappings",
+      "bhe_gold.affiliates",
       "bhe_silver.job_progress",
     ],
-    cadence: "Once per customer (re-run only on rescope)",
-    cost: "high",
+    cadence: "Once per customer (re-run only on rescope; resumable)",
+    cost: "medium",
     idempotent: true,
   },
   {
@@ -888,7 +884,7 @@ const JOBS: JobSpec[] = [
     purpose:
       "Produces the joins that power the Value & Readiness page: which canonical sources each use case requires, and which affiliates each use case applies to. Single ai_query per use case returns BOTH mappings (required_sources + applicable_affiliates) in one JSON response.",
     stages: [
-      "seed_program_affiliate_map - upsert from program_affiliate_map_seed.csv",
+      "derive_program_affiliate_map - one ai_query maps distinct silver_schemas.program values to gold.affiliates entries, MERGE into program_affiliate_map with closed-vocab guards + is_user_edited preservation (B-003 closure)",
       "extract_unresolved_use_cases - bound LLM cost to NEW use cases",
       "apply_llm_mapping - one ai_query returns both source + affiliate mappings, EXPLODE + MERGE into both child tables (with ROW_NUMBER dedup so duplicates can't enter)",
       "validate - row counts to job log",

@@ -16,6 +16,7 @@ import {
   AlertTriangle,
   FileBarChart,
   Library,
+  Lightbulb,
 } from "lucide-react";
 import {
   SidebarGroup,
@@ -65,6 +66,12 @@ function Layout() {
       label: "Dashboard",
       icon: <LayoutDashboard size={16} />,
       match: (path: string) => path === "/dashboard",
+    },
+    {
+      to: "/use-cases",
+      label: "Use Cases",
+      icon: <Lightbulb size={16} />,
+      match: (path: string) => path.startsWith("/use-cases"),
     },
     {
       to: "/value-readiness",

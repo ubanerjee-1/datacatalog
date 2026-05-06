@@ -578,7 +578,12 @@ function CompanyPage() {
     isBuildingGlossary;
 
   const hasProfile = !!profile?.company_name;
-  const hasData = !!(departments?.length || useCases?.length);
+  // `hasData` was historically `departments OR useCases`, because Step 5
+  // displayed both. Use cases moved to their own page (`/use-cases`) in
+  // 2026-05-05, so Step 5's "complete" state is now departments-only.
+  // Keeping `useCases` queried above so existing references in this file
+  // (e.g. progress narration) keep working without a refactor.
+  const hasData = !!departments?.length;
 
   // ---------------------------------------------------------------------
   // Infrastructure setup status — drives the new prerequisite cards (Step
@@ -771,10 +776,7 @@ function CompanyPage() {
         {!isResearching && hasProfile && <BrandingSection profile={profile} />}
 
         {!isResearching && hasData && (
-          <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 mt-4">
-            <DepartmentsSection departments={departments} />
-            <UseCasesSection useCases={useCases} entities={entities} />
-          </div>
+          <DepartmentsSection departments={departments} />
         )}
       </StepCard>
 

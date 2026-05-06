@@ -473,6 +473,79 @@ export async function deleteUseCase(id: string) {
   return data;
 }
 
+// --- Structured Use Case generation (PR 2 of UC redesign) ---
+
+export type UseCaseLens = "ready" | "gap" | "both";
+export type UseCaseGeneratedLens = "ready" | "gap";
+export type UseCaseTimeHorizon = "any" | "quick_win" | "strategic";
+export type UseCaseValueType = "any" | "cost" | "revenue" | "risk";
+
+export interface UseCaseGenerateIn {
+  affiliate: string;
+  department: string;
+  count: number;
+  lens: UseCaseLens;
+  time_horizon?: UseCaseTimeHorizon;
+  value_type?: UseCaseValueType;
+  prioritize_regulatory?: boolean;
+  canonical_filter?: string[];
+}
+
+export interface UseCaseCandidate {
+  candidate_id: string;
+  use_case_name: string;
+  description: string;
+  department: string;
+  affiliate: string;
+  business_value: string;
+  estimated_value_usd: number | null;
+  value_rationale: string;
+  priority: string;
+  category: string;
+  lens: UseCaseGeneratedLens;
+  time_horizon: "quick_win" | "strategic" | null;
+  value_type: "cost" | "revenue" | "risk" | "mixed" | null;
+  is_regulatory: boolean;
+  data_requirements: string[];
+  required_canonicals: string[];
+}
+
+export interface UseCaseGenerateOut {
+  preview_id: string;
+  affiliate: string;
+  department: string;
+  lens: UseCaseLens;
+  candidates: UseCaseCandidate[];
+  canonicals_present: string[];
+  canonicals_missing: string[];
+  table_sample_count: number;
+  expires_at: string | null;
+}
+
+export async function generateUseCases(
+  body: UseCaseGenerateIn,
+): Promise<UseCaseGenerateOut> {
+  const { data } = await api.post("/use-cases/generate", body);
+  return data;
+}
+
+export interface UseCaseGenerateCommitOut {
+  inserted: number;
+  skipped: number;
+  use_case_ids: string[];
+}
+
+export async function commitGeneratedUseCases(
+  preview_id: string,
+  selected_ids: string[],
+): Promise<UseCaseGenerateCommitOut> {
+  const { data } = await api.post("/use-cases/generate/commit", {
+    preview_id,
+    selected_ids,
+  });
+  return data;
+}
+
 export async function fetchEntities(params?: {
   use_case_name?: string;
   matched_only?: boolean;
