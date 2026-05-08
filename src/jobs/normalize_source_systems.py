@@ -590,15 +590,34 @@ def stage_extract_and_deterministic(spark: SparkSession, *, catalog: str,
                        ) AS raw_fuzz
                 FROM unmapped
             )
-            SELECT u.raw, u.raw_normalized, c.canonical,
-                   CASE WHEN u.raw_normalized = c.canonical_norm
-                        THEN 'exact'
-                        ELSE 'normalized'
-                   END AS mapped_by,
-                   'high' AS confidence
-            FROM unmapped_norm u
-            JOIN canonical c
-                ON trim(u.raw_fuzz) = trim(c.canonical_fuzz)
+            -- Dedup on raw_normalized: the fuzzy JOIN can produce N
+            -- canonical matches per raw (e.g. "Oracle EBS" and
+            -- "Oracle EBS Legacy" both fuzz to "oracle ebs"), and the
+            -- downstream MERGE source must be unique per ON-key or
+            -- Delta raises DELTA_MULTIPLE_SOURCE_ROW_MATCHING_TARGET_ROW.
+            -- Tiebreaker: exact normalized match > fuzzy match,
+            -- shorter canonical wins, alphabetical as final fallback.
+            SELECT raw, raw_normalized, canonical, mapped_by, confidence
+            FROM (
+                SELECT u.raw, u.raw_normalized, c.canonical,
+                       CASE WHEN u.raw_normalized = c.canonical_norm
+                            THEN 'exact'
+                            ELSE 'normalized'
+                       END AS mapped_by,
+                       'high' AS confidence,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY u.raw_normalized
+                           ORDER BY
+                               CASE WHEN u.raw_normalized = c.canonical_norm
+                                    THEN 0 ELSE 1 END,
+                               LENGTH(c.canonical),
+                               c.canonical
+                       ) AS rn
+                FROM unmapped_norm u
+                JOIN canonical c
+                    ON trim(u.raw_fuzz) = trim(c.canonical_fuzz)
+            )
+            WHERE rn = 1
         """, module=MODULE, submodule="apply_deterministic")).collect()
 
     logger.info(f"Stage 3 deterministic matches: {len(det_matches)}")
@@ -678,13 +697,24 @@ def stage_llm_fallback(spark: SparkSession, *, catalog: str, silver: str,
     logger.info(f"Loaded {len(canon)} canonical names for LLM prompt.")
 
     # Pull only raws that are still unmapped after deterministic stage.
+    # Dedup by raw_normalized: case-different raws (e.g. "Oracle" vs
+    # "oracle") must collapse to one source row before the downstream
+    # MERGE on raw_normalized — otherwise Delta raises
+    # DELTA_MULTIPLE_SOURCE_ROW_MATCHING_TARGET_ROW. Same reason we do
+    # this in stage_extract_and_deterministic and Stage 3.
     with tag_block(spark, module=MODULE, submodule="llm_extract_unmapped"):
         rows = spark.sql(tagged_sql(f"""
             WITH distinct_raws AS (
-                SELECT DISTINCT TRIM(source_system) AS raw,
-                       lower(TRIM(source_system))   AS raw_normalized
-                FROM {silver_tbl}
-                WHERE COALESCE(source_system, '') != ''
+                SELECT raw, raw_normalized FROM (
+                    SELECT TRIM(source_system) AS raw,
+                           lower(TRIM(source_system)) AS raw_normalized,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY lower(TRIM(source_system))
+                               ORDER BY TRIM(source_system)
+                           ) AS rn
+                    FROM {silver_tbl}
+                    WHERE COALESCE(source_system, '') != ''
+                ) WHERE rn = 1
             )
             SELECT d.raw, d.raw_normalized
             FROM distinct_raws d
@@ -758,22 +788,48 @@ def stage_llm_fallback(spark: SparkSession, *, catalog: str, silver: str,
                            from_json(TRIM(clean_json),
                                      'canonical STRING, confidence STRING') AS p
                     FROM cleaned
+                ),
+                shaped AS (
+                    SELECT raw, raw_normalized,
+                           CASE
+                               WHEN p.canonical IN ({canon_in_list})
+                                    THEN p.canonical
+                               ELSE 'Other'
+                           END AS canonical,
+                           CASE
+                               WHEN p.canonical IN ({canon_in_list})
+                                    THEN 'llm'
+                               ELSE 'fallback_other'
+                           END AS mapped_by,
+                           COALESCE(p.confidence, 'low') AS confidence,
+                           current_timestamp() AS mapped_at,
+                           false AS is_user_edited
+                    FROM parsed
                 )
-                SELECT raw, raw_normalized,
-                       CASE
-                           WHEN p.canonical IN ({canon_in_list})
-                                THEN p.canonical
-                           ELSE 'Other'
-                       END AS canonical,
-                       CASE
-                           WHEN p.canonical IN ({canon_in_list})
-                                THEN 'llm'
-                           ELSE 'fallback_other'
-                       END AS mapped_by,
-                       COALESCE(p.confidence, 'low') AS confidence,
-                       current_timestamp() AS mapped_at,
-                       false AS is_user_edited
-                FROM parsed
+                -- Defense-in-depth dedup on raw_normalized. The Stage 4
+                -- input is now dedup'd upstream in llm_extract_unmapped,
+                -- but we keep this filter so any future change that
+                -- accidentally lets duplicates through doesn't crash
+                -- the MERGE with DELTA_MULTIPLE_SOURCE_ROW_MATCHING_TARGET_ROW.
+                -- Tiebreaker: prefer non-'Other' (= LLM picked a real
+                -- canonical), then 'high' confidence over 'low'.
+                SELECT raw, raw_normalized, canonical, mapped_by,
+                       confidence, mapped_at, is_user_edited
+                FROM (
+                    SELECT *,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY raw_normalized
+                               ORDER BY
+                                   CASE WHEN canonical = 'Other' THEN 1 ELSE 0 END,
+                                   CASE confidence
+                                        WHEN 'high' THEN 0
+                                        WHEN 'med'  THEN 1
+                                        ELSE 2
+                                   END,
+                                   raw
+                           ) AS rn
+                    FROM shaped
+                ) WHERE rn = 1
             ) AS src
             ON target.raw_normalized = src.raw_normalized
             WHEN MATCHED AND target.is_user_edited = false
