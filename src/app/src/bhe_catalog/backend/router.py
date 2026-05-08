@@ -6785,13 +6785,33 @@ def _build_domain_discovery_prompt(
     industry = (profile.get("industry") or "").strip()
     sub_industry = (profile.get("sub_industry") or "").strip()
 
+    # Include description and category so the LLM has real grounding per
+    # canonical instead of guessing from the name alone. A bug here
+    # silently dropped descriptions and produced HR systems (Workday,
+    # SuccessFactors, Oracle HCM Cloud) being mapped to operational
+    # domains like outage_records / maintenance_records — the model
+    # was anchoring on the most prominent domains rather than reasoning
+    # per-canonical.
     canonical_lines = []
     for c in canonicals:
         n = (c.get("canonical") or "").strip()
         if not n:
             continue
         cat = (c.get("category") or "").strip()
-        canonical_lines.append(f"  - {n}" + (f" (category={cat})" if cat else ""))
+        desc = (c.get("description") or "").strip()
+        # Trim very long descriptions; we want enough signal without
+        # blowing up token budget when there are many canonicals.
+        if len(desc) > 200:
+            desc = desc[:197] + "..."
+        annot_parts: list[str] = []
+        if cat:
+            annot_parts.append(f"category={cat}")
+        if desc:
+            annot_parts.append(f"description={desc}")
+        line = f"  - {n}"
+        if annot_parts:
+            line += " (" + "; ".join(annot_parts) + ")"
+        canonical_lines.append(line)
     canonical_block = "\n".join(canonical_lines) or "  (none)"
 
     phrase_block = ""
@@ -6835,8 +6855,18 @@ def _build_domain_discovery_prompt(
         "- Produce ONE entry per canonical in the list below (skip none).\n"
         "- `domain_names` MUST reference `name` keys you defined in "
         "`domains`. List every domain this canonical typically serves "
-        "(can be 0..many; 0 is fine if the system doesn't host any of "
-        "these domains, e.g. internal tooling).\n"
+        "(0..many).\n"
+        "- **An empty array (`domain_names: []`) is REQUIRED when the "
+        "canonical's purpose has no overlap with the domains you "
+        "defined.** Do NOT guess. HR/HRIS systems (Workday, "
+        "SuccessFactors, Oracle HCM Cloud, BambooHR) typically map to "
+        "0 operational domains unless you explicitly defined an "
+        "`employee_*` / `payroll_*` / `headcount_*` domain. Same for "
+        "ITSM (ServiceNow, Jira), collaboration (Slack, M365), and "
+        "internal tooling — be honest about non-overlap.\n"
+        "- Use the canonical's `category` and `description` (provided "
+        "below) as the primary signal for what it actually hosts. The "
+        "name alone is not enough.\n"
         "- `confidence` reflects how typical the mapping is.\n\n"
         f"BHE SOURCE-SYSTEM CANONICALS:\n{canonical_block}\n"
         f"{phrase_block}\n\n"
@@ -8939,6 +8969,30 @@ async def pipeline_status() -> dict:
     except Exception:
         r = {}
 
+    # Surface the latest active enrich-schemas run from the durable mirror
+    # so the UI can hydrate `enrichRunId` after a browser refresh and resume
+    # polling without losing the live "RUNNING..." indicator. Without this,
+    # the card looks idle while the bulk MERGE is still cooking, which
+    # tempted users into a second click and triggered
+    # DELTA_CONCURRENT_APPEND.ROW_LEVEL_CHANGES (B-018 followup).
+    enrich_active_run_id: Optional[str] = None
+    enrich_active_status: Optional[str] = None
+    try:
+        active_rows = execute_query(f"""
+            SELECT run_id, status
+            FROM {fqn(silver, 'job_runs')}
+            WHERE job_type = 'enrich-schemas'
+              AND status IN ('RUNNING', 'PENDING')
+            ORDER BY start_time DESC
+            LIMIT 1
+        """, poll_timeout=10)
+        if active_rows:
+            enrich_active_run_id = active_rows[0].get("run_id")
+            enrich_active_status = active_rows[0].get("status")
+    except Exception as e:
+        # Table may not exist on the very first deploy; non-fatal.
+        logger.debug(f"pipeline_status: enrich-schemas active-run lookup skipped: {e}")
+
     # Databricks-job-backed pipeline cards: query the latest run state
     # directly. Wrapped in a per-job try/except so one missing/orphaned
     # bundle doesn't blank out the whole pipeline-status panel.
@@ -8968,6 +9022,8 @@ async def pipeline_status() -> dict:
             "last_run": r.get("enrich_last_run"),
             "enriched": int(r["enrich_done"]) if r.get("enrich_done") else 0,
             "remaining": int(r["enrich_remaining"]) if r.get("enrich_remaining") else 0,
+            "active_run_id": enrich_active_run_id,
+            "active_status": enrich_active_status,
         },
         "generate_taxonomy": {
             "last_run": r.get("taxonomy_last_run"),
@@ -8981,8 +9037,14 @@ async def pipeline_status() -> dict:
 
 
 @router.post("/jobs/enrich", operation_id="triggerEnrichJob")
-async def trigger_enrich_job(batch_size: int = Query(1000)) -> JobTriggerOut:
-    """Enrich un-enriched schemas using ai_query() serverless batch inference."""
+async def trigger_enrich_job(batch_size: int = Query(50000)) -> JobTriggerOut:
+    """Enrich un-enriched schemas using ai_query() serverless batch inference.
+
+    Default batch_size is intentionally large (50k) so a single click drains
+    the queue in one MERGE. ai_query parallelizes server-side, so a bulk call
+    is faster AND avoids the DELTA_CONCURRENT_APPEND.ROW_LEVEL_CHANGES
+    conflicts we hit when an outer poll loop fired overlapping batches. See
+    E2E run notes (B-018) for the rationale."""
     run_id = str(uuid.uuid4())[:8]
     _upsert_run(
         run_id,

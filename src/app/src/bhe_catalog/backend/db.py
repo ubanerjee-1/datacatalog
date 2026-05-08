@@ -98,7 +98,6 @@ def _execute_sql_api(
             e.g. tag_overrides={"submodule": "sankey_data.schema_lookup"}.
     """
     host = _get_host()
-    headers = _get_headers()
     url = f"{host}/api/2.0/sql/statements/"
 
     body = {
@@ -109,7 +108,14 @@ def _execute_sql_api(
         "query_tags": with_overrides(**(tag_overrides or {})),
     }
 
-    resp = requests.post(url, json=body, headers=headers)
+    # Re-fetch headers on every API call (submit + each poll). The Databricks
+    # SDK Config caches and auto-refreshes OAuth M2M tokens, so this is cheap
+    # when not expired and seamless when it is. Capturing headers once at
+    # submit time used to bite long-running ai_query MERGEs: a ~9k-row schema
+    # enrichment can run > 1h, the SP token would expire mid-poll, and the
+    # Databricks Statement Execution API would return 403 on the next poll —
+    # marking the run FAILED even though the MERGE committed on the warehouse.
+    resp = requests.post(url, json=body, headers=_get_headers())
     if resp.status_code >= 400:
         try:
             err_detail = resp.json()
@@ -127,7 +133,7 @@ def _execute_sql_api(
         time.sleep(min(poll_interval, deadline - time.time()))
         poll_interval = min(poll_interval * 1.5, 15)
         stmt_id = result["statement_id"]
-        poll_resp = requests.get(f"{url}{stmt_id}", headers=headers)
+        poll_resp = requests.get(f"{url}{stmt_id}", headers=_get_headers())
         poll_resp.raise_for_status()
         result = poll_resp.json()
 

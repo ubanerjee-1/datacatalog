@@ -465,6 +465,28 @@ function CompanyPage() {
         : false,
   });
 
+  // Hydrate enrichRunId from the durable mirror after a browser refresh.
+  // Backend (pipeline_status) surfaces the latest enrich-schemas run from
+  // silver.job_runs when it's still RUNNING/PENDING; without this, the
+  // card looks idle while the bulk MERGE is still cooking and the user
+  // gets tempted into a second click — which would trigger
+  // DELTA_CONCURRENT_APPEND.ROW_LEVEL_CHANGES on the same Delta target.
+  useEffect(() => {
+    const activeId = pipelineStatus?.enrich_schemas?.active_run_id;
+    const activeStatus = pipelineStatus?.enrich_schemas?.active_status;
+    if (
+      !enrichRunId &&
+      activeId &&
+      (activeStatus === "RUNNING" || activeStatus === "PENDING")
+    ) {
+      setEnrichRunId(activeId);
+    }
+  }, [
+    pipelineStatus?.enrich_schemas?.active_run_id,
+    pipelineStatus?.enrich_schemas?.active_status,
+    enrichRunId,
+  ]);
+
   // B-008/B-014: Run All sequential pipeline phases.
   // gold → enrich → tables → taxonomy → normalize → valuemodel → glossary
   // The last three are the orphan jobs wired in this commit. Order

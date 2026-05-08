@@ -937,6 +937,12 @@ export interface PipelineJobStatus {
   status?: string;
   run_page_url?: string;
   job_id?: number;
+  // Set by the backend when an inline-thread job (e.g. enrich-schemas) is
+  // currently RUNNING/PENDING in silver.job_runs. Lets the UI re-hydrate
+  // the run_id after a browser refresh so polling resumes seamlessly
+  // instead of the card looking idle while the bulk MERGE is in flight.
+  active_run_id?: string | null;
+  active_status?: string | null;
 }
 
 export interface PipelineStatusResponse {
@@ -954,8 +960,15 @@ export async function fetchPipelineStatus(): Promise<PipelineStatusResponse> {
   return data;
 }
 
-export async function triggerEnrichJob() {
-  const { data } = await api.post("/jobs/enrich");
+export async function triggerEnrichJob(batchSize: number = 50000) {
+  // Default 50k is intentional: ai_query parallelizes server-side, so one
+  // bulk MERGE drains all remaining schemas in a single click. Smaller
+  // batches required multiple clicks AND were prone to concurrent-MERGE
+  // conflicts when the UI polled and re-fired before the prior batch
+  // committed (DELTA_CONCURRENT_APPEND.ROW_LEVEL_CHANGES). See E2E B-018.
+  const { data } = await api.post("/jobs/enrich", null, {
+    params: { batch_size: batchSize },
+  });
   return data;
 }
 
